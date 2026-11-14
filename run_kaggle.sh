@@ -6,6 +6,7 @@
 #     !bash run_kaggle.sh            # = sanity: setup, tests, calibrate C, Step 2 grid, table
 #     !bash run_kaggle.sh collect    # Step 3: randomized collection (720 runs)
 #     !bash run_kaggle.sh all        # both, in sequence
+#     !bash run_kaggle.sh counterfactual   # GRU check 3: 384 runs, test seeds x candidate schedules
 #
 # Optional environment variables:
 #     JOBS=4          parallel runs (default: number of CPUs)
@@ -20,7 +21,7 @@
 set -euo pipefail
 
 STAGE="${1:-sanity}"
-case "$STAGE" in sanity|collect|all) ;; *) echo "usage: $0 [sanity|collect|all]"; exit 2;; esac
+case "$STAGE" in sanity|collect|all|counterfactual) ;; *) echo "usage: $0 [sanity|collect|all|counterfactual]"; exit 2;; esac
 if [ -d /kaggle/working ]; then DEFAULT_WORK=/kaggle/working/testbed; else DEFAULT_WORK="$PWD/testbed"; fi
 WORK="${WORK:-$DEFAULT_WORK}"
 JOBS="${JOBS:-$(nproc)}"
@@ -309,6 +310,7 @@ cat > poison_testbed/runner.py <<'__KRUM_TESTBED_EOF__'
 import hashlib
 import json
 import math
+import re
 import subprocess
 import time
 from dataclasses import asdict, dataclass, field
@@ -364,7 +366,7 @@ class RunConfig:
     seed: int
     C: float
     sigma: float
-    schedule: str = "random"  # "random" | "on" | "off"
+    schedule: str = "random"  # "random" | "on" | "off" | "cf_<on|off|ontil20|offtil20|alt>_p<prefix>"
     schedule_seed: int | None = None  # default: 1000 + seed
     n: int = 16
     f: int = 3
@@ -394,6 +396,26 @@ class RunConfig:
         return hashlib.sha256(payload.encode()).hexdigest()[:16]
 
 
+CF_SCHEDULE = re.compile(r"cf_(on|off|ontil20|offtil20|alt)_p(\d+)")
+
+
+def counterfactual_schedule(name: str, prefix: int, n_blocks: int) -> list[int]:
+    """Defended prefix of ``prefix`` blocks, then a candidate continuation.
+
+    on: always on; off: always off; ontil20: on through block 19 then off;
+    offtil20: off through block 19 then on; alt: alternate, starting off.
+    """
+    rest = range(prefix, n_blocks)
+    cont = {
+        "on": [1 for _ in rest],
+        "off": [0 for _ in rest],
+        "ontil20": [int(b < 20) for b in rest],
+        "offtil20": [int(b >= 20) for b in rest],
+        "alt": [int((b - prefix) % 2 == 1) for b in rest],
+    }[name]
+    return [1] * prefix + cont
+
+
 def make_schedule(cfg: RunConfig) -> list[int]:
     if cfg.schedule == "on":
         return [1] * cfg.n_blocks
@@ -402,6 +424,8 @@ def make_schedule(cfg: RunConfig) -> list[int]:
     if cfg.schedule == "random":
         gen = torch.Generator().manual_seed(cfg.sched_seed)
         return torch.bernoulli(torch.full((cfg.n_blocks,), 0.5), generator=gen).int().tolist()
+    if m := CF_SCHEDULE.fullmatch(cfg.schedule):
+        return counterfactual_schedule(m.group(1), int(m.group(2)), cfg.n_blocks)
     raise ValueError(f"Unknown schedule {cfg.schedule!r}")
 
 
@@ -693,6 +717,7 @@ cat > run_experiment.py <<'__KRUM_TESTBED_EOF__'
     python run_experiment.py calibrate                 # fix C once -> calibration.json
     python run_experiment.py sanity  [--jobs 3]        # Step 2: always-off vs always-on, 3 seeds
     python run_experiment.py collect [--jobs 3]        # Step 3: random Bernoulli(0.5) schedules, 20 seeds
+    python run_experiment.py counterfactual            # GRU check 3: test seeds x candidate schedules
     python run_experiment.py report                    # Step 2 table from runs_sanity/
 
 Any RunConfig field can be overridden with --set key=value (e.g. --set sigma=0.02 --set sign_flip_scale=5).
@@ -796,6 +821,23 @@ def cmd_collect(args: argparse.Namespace) -> None:
     execute(configs, ROOT / (args.out or "runs"), args.jobs)
 
 
+CF_SEEDS = [16, 17, 18, 19]  # the GRU's held-out test seeds
+CF_ATTACKS = ["none", "backdoor", "backdoor_win", "sign_flip"]
+CF_DEFENSES = ["ClipNoise", "Krum", "Median", "Bulyan"]
+CF_PREFIX = 3
+CF_SCHEDULES = ["random", *(f"cf_{c}_p{CF_PREFIX}" for c in ["on", "off", "ontil20", "offtil20", "alt"])]
+
+
+def cmd_counterfactual(args: argparse.Namespace) -> None:
+    """Check 3: true counterfactuals for held-out seeds. 'random' re-runs the xp1 schedule (reproduction check)."""
+    p = base_params(parse_overrides(args.set))
+    seeds = range(args.seeds) if args.seeds else CF_SEEDS
+    attacks, defenses = args.attacks or CF_ATTACKS, args.defenses or CF_DEFENSES
+    configs = [RunConfig(attack=a, defense=d, seed=s, schedule=sch, **p)
+               for a in attacks for d in defenses for s in seeds for sch in CF_SCHEDULES]
+    execute(configs, ROOT / (args.out or "runs_cf"), args.jobs)
+
+
 def cmd_report(args: argparse.Namespace) -> None:
     """Step 2 table: final outcomes per (attack, arm), mean ± sd over seeds, and the on − off gaps."""
     root = ROOT / (args.out or "runs_sanity")
@@ -839,7 +881,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = parser.add_subparsers(dest="cmd", required=True)
     for name, fn in [("calibrate", cmd_calibrate), ("sanity", cmd_sanity), ("collect", cmd_collect),
-                     ("report", cmd_report)]:
+                     ("counterfactual", cmd_counterfactual), ("report", cmd_report)]:
         sp = sub.add_parser(name)
         sp.set_defaults(fn=fn)
         sp.add_argument("--set", action="append", default=[], metavar="KEY=VALUE")
@@ -923,6 +965,17 @@ def test_window_and_labels():
     assert simulate(RunConfig(attack="alie", defense="Krum", seed=0, **SHORT)).y_atk.isna().all()
 
 
+def test_counterfactual_schedules_share_the_defended_prefix():
+    from poison_testbed.runner import counterfactual_schedule
+
+    scheds = {n: counterfactual_schedule(n, 3, 50) for n in ["on", "off", "ontil20", "offtil20", "alt"]}
+    assert all(len(s) == 50 and s[:3] == [1, 1, 1] for s in scheds.values())
+    assert sum(scheds["off"]) == 3 and sum(scheds["on"]) == 50
+    assert scheds["ontil20"][19] == 1 and scheds["ontil20"][20] == 0
+    assert scheds["offtil20"][19] == 0 and scheds["offtil20"][20] == 1
+    assert scheds["alt"][3:7] == [0, 1, 0, 1]
+
+
 def test_no_attack_uses_all_workers_honestly():
     """attack=none with f=3: the 3 'Byzantine' workers are honest, so it equals an f=3 run whose window never opens."""
     a = simulate(RunConfig(attack="none", defense="Krum", seed=2, **SHORT))
@@ -965,10 +1018,21 @@ run_collect() {
   echo "== saved $(dirname "$WORK")/results_collect.zip"
 }
 
+# C from xp1, pinned so that re-running an xp1 schedule reproduces the xp1 run exactly.
+XP1_C=3.0552712798118593
+
+run_counterfactual() {
+  echo "== GRU check 3: true counterfactuals (4 seeds x 16 conditions x 6 schedules = 384 runs)"
+  "$PY" -u run_experiment.py counterfactual --jobs "$JOBS" --set C=$XP1_C $EXTRA
+  (cd "$WORK" && zip -qr "$WORK/../results_cf.zip" runs_cf)
+  echo "== saved $(dirname "$WORK")/results_cf.zip"
+}
+
 SECONDS=0
 case "$STAGE" in
-  sanity)  run_sanity ;;
-  collect) run_collect ;;
-  all)     run_sanity; run_collect ;;
+  sanity)         run_sanity ;;
+  collect)        run_collect ;;
+  all)            run_sanity; run_collect ;;
+  counterfactual) run_counterfactual ;;
 esac
 echo "== done in $((SECONDS / 60)) min"
