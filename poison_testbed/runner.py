@@ -3,6 +3,7 @@
 import hashlib
 import json
 import math
+import re
 import subprocess
 import time
 from dataclasses import asdict, dataclass, field
@@ -58,7 +59,7 @@ class RunConfig:
     seed: int
     C: float
     sigma: float
-    schedule: str = "random"  # "random" | "on" | "off"
+    schedule: str = "random"  # "random" | "on" | "off" | "cf_<on|off|ontil20|offtil20|alt>_p<prefix>"
     schedule_seed: int | None = None  # default: 1000 + seed
     n: int = 16
     f: int = 3
@@ -88,6 +89,26 @@ class RunConfig:
         return hashlib.sha256(payload.encode()).hexdigest()[:16]
 
 
+CF_SCHEDULE = re.compile(r"cf_(on|off|ontil20|offtil20|alt)_p(\d+)")
+
+
+def counterfactual_schedule(name: str, prefix: int, n_blocks: int) -> list[int]:
+    """Defended prefix of ``prefix`` blocks, then a candidate continuation.
+
+    on: always on; off: always off; ontil20: on through block 19 then off;
+    offtil20: off through block 19 then on; alt: alternate, starting off.
+    """
+    rest = range(prefix, n_blocks)
+    cont = {
+        "on": [1 for _ in rest],
+        "off": [0 for _ in rest],
+        "ontil20": [int(b < 20) for b in rest],
+        "offtil20": [int(b >= 20) for b in rest],
+        "alt": [int((b - prefix) % 2 == 1) for b in rest],
+    }[name]
+    return [1] * prefix + cont
+
+
 def make_schedule(cfg: RunConfig) -> list[int]:
     if cfg.schedule == "on":
         return [1] * cfg.n_blocks
@@ -96,6 +117,8 @@ def make_schedule(cfg: RunConfig) -> list[int]:
     if cfg.schedule == "random":
         gen = torch.Generator().manual_seed(cfg.sched_seed)
         return torch.bernoulli(torch.full((cfg.n_blocks,), 0.5), generator=gen).int().tolist()
+    if m := CF_SCHEDULE.fullmatch(cfg.schedule):
+        return counterfactual_schedule(m.group(1), int(m.group(2)), cfg.n_blocks)
     raise ValueError(f"Unknown schedule {cfg.schedule!r}")
 
 

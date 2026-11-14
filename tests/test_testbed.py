@@ -61,6 +61,17 @@ def test_window_and_labels():
     assert simulate(RunConfig(attack="alie", defense="Krum", seed=0, **SHORT)).y_atk.isna().all()
 
 
+def test_counterfactual_schedules_share_the_defended_prefix():
+    from poison_testbed.runner import counterfactual_schedule
+
+    scheds = {n: counterfactual_schedule(n, 3, 50) for n in ["on", "off", "ontil20", "offtil20", "alt"]}
+    assert all(len(s) == 50 and s[:3] == [1, 1, 1] for s in scheds.values())
+    assert sum(scheds["off"]) == 3 and sum(scheds["on"]) == 50
+    assert scheds["ontil20"][19] == 1 and scheds["ontil20"][20] == 0
+    assert scheds["offtil20"][19] == 0 and scheds["offtil20"][20] == 1
+    assert scheds["alt"][3:7] == [0, 1, 0, 1]
+
+
 def test_no_attack_uses_all_workers_honestly():
     """attack=none with f=3: the 3 'Byzantine' workers are honest, so it equals an f=3 run whose window never opens."""
     a = simulate(RunConfig(attack="none", defense="Krum", seed=2, **SHORT))

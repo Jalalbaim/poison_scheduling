@@ -6,6 +6,7 @@
 #     !bash run_kaggle.sh            # = sanity: setup, tests, calibrate C, Step 2 grid, table
 #     !bash run_kaggle.sh collect    # Step 3: randomized collection (720 runs)
 #     !bash run_kaggle.sh all        # both, in sequence
+#     !bash run_kaggle.sh counterfactual   # GRU check 3: 384 runs, test seeds x candidate schedules
 #
 # Optional environment variables:
 #     JOBS=4          parallel runs (default: number of CPUs)
@@ -20,7 +21,7 @@
 set -euo pipefail
 
 STAGE="${1:-sanity}"
-case "$STAGE" in sanity|collect|all) ;; *) echo "usage: $0 [sanity|collect|all]"; exit 2;; esac
+case "$STAGE" in sanity|collect|all|counterfactual) ;; *) echo "usage: $0 [sanity|collect|all|counterfactual]"; exit 2;; esac
 if [ -d /kaggle/working ]; then DEFAULT_WORK=/kaggle/working/testbed; else DEFAULT_WORK="$PWD/testbed"; fi
 WORK="${WORK:-$DEFAULT_WORK}"
 JOBS="${JOBS:-$(nproc)}"
