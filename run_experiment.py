@@ -3,6 +3,7 @@
     python run_experiment.py calibrate                 # fix C once -> calibration.json
     python run_experiment.py sanity  [--jobs 3]        # Step 2: always-off vs always-on, 3 seeds
     python run_experiment.py collect [--jobs 3]        # Step 3: random Bernoulli(0.5) schedules, 20 seeds
+    python run_experiment.py counterfactual            # GRU check 3: test seeds x candidate schedules
     python run_experiment.py report                    # Step 2 table from runs_sanity/
 
 Any RunConfig field can be overridden with --set key=value (e.g. --set sigma=0.02 --set sign_flip_scale=5).
@@ -106,6 +107,23 @@ def cmd_collect(args: argparse.Namespace) -> None:
     execute(configs, ROOT / (args.out or "runs"), args.jobs)
 
 
+CF_SEEDS = [16, 17, 18, 19]  # the GRU's held-out test seeds
+CF_ATTACKS = ["none", "backdoor", "backdoor_win", "sign_flip"]
+CF_DEFENSES = ["ClipNoise", "Krum", "Median", "Bulyan"]
+CF_PREFIX = 3
+CF_SCHEDULES = ["random", *(f"cf_{c}_p{CF_PREFIX}" for c in ["on", "off", "ontil20", "offtil20", "alt"])]
+
+
+def cmd_counterfactual(args: argparse.Namespace) -> None:
+    """Check 3: true counterfactuals for held-out seeds. 'random' re-runs the xp1 schedule (reproduction check)."""
+    p = base_params(parse_overrides(args.set))
+    seeds = range(args.seeds) if args.seeds else CF_SEEDS
+    attacks, defenses = args.attacks or CF_ATTACKS, args.defenses or CF_DEFENSES
+    configs = [RunConfig(attack=a, defense=d, seed=s, schedule=sch, **p)
+               for a in attacks for d in defenses for s in seeds for sch in CF_SCHEDULES]
+    execute(configs, ROOT / (args.out or "runs_cf"), args.jobs)
+
+
 def cmd_report(args: argparse.Namespace) -> None:
     """Step 2 table: final outcomes per (attack, arm), mean ± sd over seeds, and the on − off gaps."""
     root = ROOT / (args.out or "runs_sanity")
@@ -149,7 +167,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = parser.add_subparsers(dest="cmd", required=True)
     for name, fn in [("calibrate", cmd_calibrate), ("sanity", cmd_sanity), ("collect", cmd_collect),
-                     ("report", cmd_report)]:
+                     ("counterfactual", cmd_counterfactual), ("report", cmd_report)]:
         sp = sub.add_parser(name)
         sp.set_defaults(fn=fn)
         sp.add_argument("--set", action="append", default=[], metavar="KEY=VALUE")
