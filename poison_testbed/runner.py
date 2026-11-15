@@ -8,7 +8,7 @@ import subprocess
 import time
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 import pandas as pd
 import torch
@@ -59,7 +59,9 @@ class RunConfig:
     seed: int
     C: float
     sigma: float
-    schedule: str = "random"  # "random" | "on" | "off" | "cf_<on|off|ontil20|offtil20|alt>_p<prefix>"
+    # "random" | "on" | "off" | "policy" | "cf_<on|off|ontil20|offtil20|alt>_p<prefix>"
+    # | "sticky_p<switch prob>" | "react_d<delay>_e<extra>" (blocks, relative to `window`)
+    schedule: str = "random"
     schedule_seed: int | None = None  # default: 1000 + seed
     n: int = 16
     f: int = 3
@@ -90,6 +92,8 @@ class RunConfig:
 
 
 CF_SCHEDULE = re.compile(r"cf_(on|off|ontil20|offtil20|alt)_p(\d+)")
+STICKY_SCHEDULE = re.compile(r"sticky_p([0-9.]+)")
+REACT_SCHEDULE = re.compile(r"react_d(-?\d+)_e(\d+)")
 
 
 def counterfactual_schedule(name: str, prefix: int, n_blocks: int) -> list[int]:
@@ -117,6 +121,25 @@ def make_schedule(cfg: RunConfig) -> list[int]:
     if cfg.schedule == "random":
         gen = torch.Generator().manual_seed(cfg.sched_seed)
         return torch.bernoulli(torch.full((cfg.n_blocks,), 0.5), generator=gen).int().tolist()
+    if cfg.schedule == "policy":
+        return [0] * cfg.n_blocks  # placeholder: each entry is set online by the policy before its block runs
+    if m := STICKY_SCHEDULE.fullmatch(cfg.schedule):
+        # Two-state Markov chain: random initial state, switch with probability p before each block.
+        gen = torch.Generator().manual_seed(cfg.sched_seed)
+        p = float(m.group(1))
+        state = int(torch.rand(1, generator=gen).item() < 0.5)
+        out = []
+        for _ in range(cfg.n_blocks):
+            out.append(state)
+            if torch.rand(1, generator=gen).item() < p:
+                state = 1 - state
+        return out
+    if m := REACT_SCHEDULE.fullmatch(cfg.schedule):
+        # Defend from window start + delay through window end + extra. Follows cfg.window whether or not an
+        # attack happens (phantom window for no-attack runs), so W never reveals the attack by itself.
+        delay, extra = int(m.group(1)), int(m.group(2))
+        on, off = cfg.window[0] + delay, cfg.window[1] + extra
+        return [int(on <= b <= off) for b in range(cfg.n_blocks)]
     if m := CF_SCHEDULE.fullmatch(cfg.schedule):
         return counterfactual_schedule(m.group(1), int(m.group(2)), cfg.n_blocks)
     raise ValueError(f"Unknown schedule {cfg.schedule!r}")
@@ -162,22 +185,43 @@ def _outcomes(sim: PoisoningSimulation, cfg: RunConfig) -> dict[str, float]:
     return {"x_val_acc": val_acc, "y_clean_acc": acc, "y_clean_loss": loss, "y_atk": y_atk}
 
 
-def simulate(cfg: RunConfig) -> pd.DataFrame:
-    """Train one run and return its block table (no file I/O)."""
+HIDDEN_FROM_POLICY = ("y_", "u_", "attack")
+
+
+def observable(row: dict[str, Any]) -> dict[str, Any]:
+    """What a defender can see: drops outcomes (y_*), attack labels (u_*) and the attack name."""
+    return {k: v for k, v in row.items() if not k.startswith(HIDDEN_FROM_POLICY)}
+
+
+Policy = Callable[[list[dict[str, Any]], int], tuple[int, dict[str, Any]]]
+
+
+def simulate(cfg: RunConfig, policy: Policy | None = None) -> pd.DataFrame:
+    """Train one run and return its block table (no file I/O).
+
+    ``policy(history, b) -> (W_b, extra)``, if given, decides W for block b before it runs. ``history`` holds the
+    observable part of rows -1..b-1 only (see ``observable``). ``extra`` is logged on block b's row.
+    """
     sim = build(cfg)
     base = {"run_id": cfg.run_id, "seed": cfg.seed, "schedule_seed": cfg.sched_seed, "defense": cfg.defense,
             "attack": cfg.attack, "n": cfg.n, "f": cfg.f}
     rows = [{**base, "block": -1, "round_start": pd.NA, "lr": sim._current_lr, "W": pd.NA,
              **{c: math.nan for c in X_COLUMNS}, **_outcomes(sim, cfg), "u_active": 0, "u_type": "none"}]
+    extra_cols: list[str] = []
     for b in range(cfg.n_blocks):
+        extra: dict[str, Any] = {}
+        if policy is not None:
+            w, extra = policy([observable(r) for r in rows], b)
+            sim.schedule[b] = int(w)
+            extra_cols += [k for k in extra if k not in extra_cols]
         lr = sim._current_lr
         per_round = [sim.step() for _ in range(cfg.block_len)]
         x_block = {c: sum(r[c] for r in per_round) / len(per_round) for c in X_COLUMNS}
         active = sim.attack_spec.active(b)
         rows.append({**base, "block": b, "round_start": b * cfg.block_len, "lr": lr, "W": sim.schedule[b],
                      **x_block, **_outcomes(sim, cfg),
-                     "u_active": int(active), "u_type": cfg.attack if active else "none"})
-    df = pd.DataFrame(rows, columns=COLUMNS)
+                     "u_active": int(active), "u_type": cfg.attack if active else "none", **extra})
+    df = pd.DataFrame(rows, columns=COLUMNS + extra_cols)
     return df.astype({"round_start": "Int64", "W": "Int64"})
 
 
