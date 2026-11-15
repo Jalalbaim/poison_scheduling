@@ -72,6 +72,21 @@ def test_counterfactual_schedules_share_the_defended_prefix():
     assert scheds["alt"][3:7] == [0, 1, 0, 1]
 
 
+def test_sticky_and_react_schedules():
+    from poison_testbed.runner import make_schedule
+
+    base = dict(attack="none", defense="Krum", seed=5, C=1.0, sigma=0.0, n_blocks=250, block_len=2, window=(40, 99))
+    sticky = make_schedule(RunConfig(schedule="sticky_p0.02", **base))
+    assert sticky == make_schedule(RunConfig(schedule="sticky_p0.02", **base))  # seeded
+    assert len(sticky) == 250 and set(sticky) <= {0, 1}
+    switches = sum(a != b for a, b in zip(sticky, sticky[1:]))
+    assert switches < 25  # sticky: long stretches
+    react = make_schedule(RunConfig(schedule="react_d3_e5", **base))
+    assert react.index(1) == 43 and max(i for i, w in enumerate(react) if w) == 104 and sum(react) == 62
+    early = make_schedule(RunConfig(schedule="react_d-4_e0", **base))
+    assert early.index(1) == 36
+
+
 def test_no_attack_uses_all_workers_honestly():
     """attack=none with f=3: the 3 'Byzantine' workers are honest, so it equals an f=3 run whose window never opens."""
     a = simulate(RunConfig(attack="none", defense="Krum", seed=2, **SHORT))
