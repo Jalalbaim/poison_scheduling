@@ -7,6 +7,7 @@
 #     !bash run_kaggle.sh collect    # Step 3: randomized collection (720 runs)
 #     !bash run_kaggle.sh all        # both, in sequence
 #     !bash run_kaggle.sh counterfactual   # GRU check 3: 384 runs, test seeds x candidate schedules
+#     !bash run_kaggle.sh xp2              # xp2: 260 runs, windowed backdoor + Krum, data with kills
 #
 # Optional environment variables:
 #     JOBS=4          parallel runs (default: number of CPUs)
@@ -21,7 +22,7 @@
 set -euo pipefail
 
 STAGE="${1:-sanity}"
-case "$STAGE" in sanity|collect|all|counterfactual) ;; *) echo "usage: $0 [sanity|collect|all|counterfactual]"; exit 2;; esac
+case "$STAGE" in sanity|collect|all|counterfactual|xp2) ;; *) echo "usage: $0 [sanity|collect|all|counterfactual|xp2]"; exit 2;; esac
 if [ -d /kaggle/working ]; then DEFAULT_WORK=/kaggle/working/testbed; else DEFAULT_WORK="$PWD/testbed"; fi
 WORK="${WORK:-$DEFAULT_WORK}"
 JOBS="${JOBS:-$(nproc)}"
@@ -315,7 +316,7 @@ import subprocess
 import time
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 import pandas as pd
 import torch
@@ -366,7 +367,9 @@ class RunConfig:
     seed: int
     C: float
     sigma: float
-    schedule: str = "random"  # "random" | "on" | "off" | "cf_<on|off|ontil20|offtil20|alt>_p<prefix>"
+    # "random" | "on" | "off" | "policy" | "cf_<on|off|ontil20|offtil20|alt>_p<prefix>"
+    # | "sticky_p<switch prob>" | "react_d<delay>_e<extra>" (blocks, relative to `window`)
+    schedule: str = "random"
     schedule_seed: int | None = None  # default: 1000 + seed
     n: int = 16
     f: int = 3
@@ -397,6 +400,8 @@ class RunConfig:
 
 
 CF_SCHEDULE = re.compile(r"cf_(on|off|ontil20|offtil20|alt)_p(\d+)")
+STICKY_SCHEDULE = re.compile(r"sticky_p([0-9.]+)")
+REACT_SCHEDULE = re.compile(r"react_d(-?\d+)_e(\d+)")
 
 
 def counterfactual_schedule(name: str, prefix: int, n_blocks: int) -> list[int]:
@@ -424,6 +429,25 @@ def make_schedule(cfg: RunConfig) -> list[int]:
     if cfg.schedule == "random":
         gen = torch.Generator().manual_seed(cfg.sched_seed)
         return torch.bernoulli(torch.full((cfg.n_blocks,), 0.5), generator=gen).int().tolist()
+    if cfg.schedule == "policy":
+        return [0] * cfg.n_blocks  # placeholder: each entry is set online by the policy before its block runs
+    if m := STICKY_SCHEDULE.fullmatch(cfg.schedule):
+        # Two-state Markov chain: random initial state, switch with probability p before each block.
+        gen = torch.Generator().manual_seed(cfg.sched_seed)
+        p = float(m.group(1))
+        state = int(torch.rand(1, generator=gen).item() < 0.5)
+        out = []
+        for _ in range(cfg.n_blocks):
+            out.append(state)
+            if torch.rand(1, generator=gen).item() < p:
+                state = 1 - state
+        return out
+    if m := REACT_SCHEDULE.fullmatch(cfg.schedule):
+        # Defend from window start + delay through window end + extra. Follows cfg.window whether or not an
+        # attack happens (phantom window for no-attack runs), so W never reveals the attack by itself.
+        delay, extra = int(m.group(1)), int(m.group(2))
+        on, off = cfg.window[0] + delay, cfg.window[1] + extra
+        return [int(on <= b <= off) for b in range(cfg.n_blocks)]
     if m := CF_SCHEDULE.fullmatch(cfg.schedule):
         return counterfactual_schedule(m.group(1), int(m.group(2)), cfg.n_blocks)
     raise ValueError(f"Unknown schedule {cfg.schedule!r}")
@@ -469,22 +493,43 @@ def _outcomes(sim: PoisoningSimulation, cfg: RunConfig) -> dict[str, float]:
     return {"x_val_acc": val_acc, "y_clean_acc": acc, "y_clean_loss": loss, "y_atk": y_atk}
 
 
-def simulate(cfg: RunConfig) -> pd.DataFrame:
-    """Train one run and return its block table (no file I/O)."""
+HIDDEN_FROM_POLICY = ("y_", "u_", "attack")
+
+
+def observable(row: dict[str, Any]) -> dict[str, Any]:
+    """What a defender can see: drops outcomes (y_*), attack labels (u_*) and the attack name."""
+    return {k: v for k, v in row.items() if not k.startswith(HIDDEN_FROM_POLICY)}
+
+
+Policy = Callable[[list[dict[str, Any]], int], tuple[int, dict[str, Any]]]
+
+
+def simulate(cfg: RunConfig, policy: Policy | None = None) -> pd.DataFrame:
+    """Train one run and return its block table (no file I/O).
+
+    ``policy(history, b) -> (W_b, extra)``, if given, decides W for block b before it runs. ``history`` holds the
+    observable part of rows -1..b-1 only (see ``observable``). ``extra`` is logged on block b's row.
+    """
     sim = build(cfg)
     base = {"run_id": cfg.run_id, "seed": cfg.seed, "schedule_seed": cfg.sched_seed, "defense": cfg.defense,
             "attack": cfg.attack, "n": cfg.n, "f": cfg.f}
     rows = [{**base, "block": -1, "round_start": pd.NA, "lr": sim._current_lr, "W": pd.NA,
              **{c: math.nan for c in X_COLUMNS}, **_outcomes(sim, cfg), "u_active": 0, "u_type": "none"}]
+    extra_cols: list[str] = []
     for b in range(cfg.n_blocks):
+        extra: dict[str, Any] = {}
+        if policy is not None:
+            w, extra = policy([observable(r) for r in rows], b)
+            sim.schedule[b] = int(w)
+            extra_cols += [k for k in extra if k not in extra_cols]
         lr = sim._current_lr
         per_round = [sim.step() for _ in range(cfg.block_len)]
         x_block = {c: sum(r[c] for r in per_round) / len(per_round) for c in X_COLUMNS}
         active = sim.attack_spec.active(b)
         rows.append({**base, "block": b, "round_start": b * cfg.block_len, "lr": lr, "W": sim.schedule[b],
                      **x_block, **_outcomes(sim, cfg),
-                     "u_active": int(active), "u_type": cfg.attack if active else "none"})
-    df = pd.DataFrame(rows, columns=COLUMNS)
+                     "u_active": int(active), "u_type": cfg.attack if active else "none", **extra})
+    df = pd.DataFrame(rows, columns=COLUMNS + extra_cols)
     return df.astype({"round_start": "Int64", "W": "Int64"})
 
 
@@ -718,6 +763,7 @@ cat > run_experiment.py <<'__KRUM_TESTBED_EOF__'
     python run_experiment.py sanity  [--jobs 3]        # Step 2: always-off vs always-on, 3 seeds
     python run_experiment.py collect [--jobs 3]        # Step 3: random Bernoulli(0.5) schedules, 20 seeds
     python run_experiment.py counterfactual            # GRU check 3: test seeds x candidate schedules
+    python run_experiment.py xp2 [--jobs 4]            # xp2: windowed backdoor + Krum, data with kills
     python run_experiment.py report                    # Step 2 table from runs_sanity/
 
 Any RunConfig field can be overridden with --set key=value (e.g. --set sigma=0.02 --set sign_flip_scale=5).
@@ -732,6 +778,7 @@ from concurrent.futures import ProcessPoolExecutor, as_completed
 from multiprocessing import get_context
 from pathlib import Path
 
+import numpy as np
 import pandas as pd
 
 import poison_testbed  # noqa: F401  (sets CUBLAS_WORKSPACE_CONFIG before torch touches CUDA)
@@ -838,6 +885,42 @@ def cmd_counterfactual(args: argparse.Namespace) -> None:
     execute(configs, ROOT / (args.out or "runs_cf"), args.jobs)
 
 
+XP1_C = 3.0552712798118593  # pinned: X signals (x_frac_clipped) stay comparable with xp1
+XP2_RUNS = 260
+XP2_BLOCK_LEN, XP2_BLOCKS = 2, 250  # decide every 2 rounds; 500 rounds as in xp1
+XP2_STICKY_P = [0.01, 0.02, 0.05, 0.1]
+XP2_REACT_DELAY = [-4, -2, 0, 1, 2, 3, 5, 8, 12]  # blocks of 2 rounds after the window start
+XP2_REACT_EXTRA = [0, 2, 5, 10]
+
+
+def xp2_config(i: int, overrides: dict) -> RunConfig:
+    """Run i of xp2: its own seed, a random window (real or phantom), and a random schedule.
+
+    Attack mix by i % 10: 0-5 windowed backdoor, 6-7 none, 8-9 continuous backdoor. Every run draws a
+    window; react schedules follow it whether or not an attack happens, so W never reveals the attack.
+    """
+    rng = np.random.default_rng(20_000 + i)  # per-run stream: adding runs never changes earlier ones
+    attack = ["backdoor_win"] * 6 + ["none"] * 2 + ["backdoor"] * 2
+    start = int(rng.integers(25, 151))
+    window = (start, start + int(rng.integers(30, 81)) - 1)
+    family = rng.choice(["sticky", "react", "on", "off"], p=[0.45, 0.45, 0.05, 0.05])
+    if family == "sticky":
+        schedule = f"sticky_p{rng.choice(XP2_STICKY_P)}"
+    elif family == "react":
+        schedule = f"react_d{rng.choice(XP2_REACT_DELAY)}_e{rng.choice(XP2_REACT_EXTRA)}"
+    else:
+        schedule = str(family)
+    params = {"C": XP1_C, "sigma": DEFAULT_SIGMA, "block_len": XP2_BLOCK_LEN, "n_blocks": XP2_BLOCKS, **overrides}
+    return RunConfig(attack=attack[i % 10], defense="Krum", seed=i, schedule=schedule, window=window, **params)
+
+
+def cmd_xp2(args: argparse.Namespace) -> None:
+    """xp2: training data that contains kills (windowed backdoor + Krum, decisions every 2 rounds)."""
+    over = parse_overrides(args.set)
+    configs = [xp2_config(i, over) for i in range(args.seeds or XP2_RUNS)]
+    execute(configs, ROOT / (args.out or "runs_xp2"), args.jobs)
+
+
 def cmd_report(args: argparse.Namespace) -> None:
     """Step 2 table: final outcomes per (attack, arm), mean ± sd over seeds, and the on − off gaps."""
     root = ROOT / (args.out or "runs_sanity")
@@ -881,7 +964,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = parser.add_subparsers(dest="cmd", required=True)
     for name, fn in [("calibrate", cmd_calibrate), ("sanity", cmd_sanity), ("collect", cmd_collect),
-                     ("counterfactual", cmd_counterfactual), ("report", cmd_report)]:
+                     ("counterfactual", cmd_counterfactual), ("xp2", cmd_xp2), ("report", cmd_report)]:
         sp = sub.add_parser(name)
         sp.set_defaults(fn=fn)
         sp.add_argument("--set", action="append", default=[], metavar="KEY=VALUE")
@@ -976,6 +1059,21 @@ def test_counterfactual_schedules_share_the_defended_prefix():
     assert scheds["alt"][3:7] == [0, 1, 0, 1]
 
 
+def test_sticky_and_react_schedules():
+    from poison_testbed.runner import make_schedule
+
+    base = dict(attack="none", defense="Krum", seed=5, C=1.0, sigma=0.0, n_blocks=250, block_len=2, window=(40, 99))
+    sticky = make_schedule(RunConfig(schedule="sticky_p0.02", **base))
+    assert sticky == make_schedule(RunConfig(schedule="sticky_p0.02", **base))  # seeded
+    assert len(sticky) == 250 and set(sticky) <= {0, 1}
+    switches = sum(a != b for a, b in zip(sticky, sticky[1:]))
+    assert switches < 25  # sticky: long stretches
+    react = make_schedule(RunConfig(schedule="react_d3_e5", **base))
+    assert react.index(1) == 43 and max(i for i, w in enumerate(react) if w) == 104 and sum(react) == 62
+    early = make_schedule(RunConfig(schedule="react_d-4_e0", **base))
+    assert early.index(1) == 36
+
+
 def test_no_attack_uses_all_workers_honestly():
     """attack=none with f=3: the 3 'Byzantine' workers are honest, so it equals an f=3 run whose window never opens."""
     a = simulate(RunConfig(attack="none", defense="Krum", seed=2, **SHORT))
@@ -1028,11 +1126,19 @@ run_counterfactual() {
   echo "== saved $(dirname "$WORK")/results_cf.zip"
 }
 
+run_xp2() {
+  echo "== xp2: windowed backdoor + Krum, decisions every 2 rounds, schedules with kills (260 runs)"
+  "$PY" -u run_experiment.py xp2 --jobs "$JOBS" $EXTRA
+  (cd "$WORK" && zip -qr "$WORK/../results_xp2.zip" runs_xp2)
+  echo "== saved $(dirname "$WORK")/results_xp2.zip"
+}
+
 SECONDS=0
 case "$STAGE" in
   sanity)         run_sanity ;;
   collect)        run_collect ;;
   all)            run_sanity; run_collect ;;
   counterfactual) run_counterfactual ;;
+  xp2)            run_xp2 ;;
 esac
 echo "== done in $((SECONDS / 60)) min"

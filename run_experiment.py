@@ -4,6 +4,7 @@
     python run_experiment.py sanity  [--jobs 3]        # Step 2: always-off vs always-on, 3 seeds
     python run_experiment.py collect [--jobs 3]        # Step 3: random Bernoulli(0.5) schedules, 20 seeds
     python run_experiment.py counterfactual            # GRU check 3: test seeds x candidate schedules
+    python run_experiment.py xp2 [--jobs 4]            # xp2: windowed backdoor + Krum, data with kills
     python run_experiment.py report                    # Step 2 table from runs_sanity/
 
 Any RunConfig field can be overridden with --set key=value (e.g. --set sigma=0.02 --set sign_flip_scale=5).
@@ -18,6 +19,7 @@ from concurrent.futures import ProcessPoolExecutor, as_completed
 from multiprocessing import get_context
 from pathlib import Path
 
+import numpy as np
 import pandas as pd
 
 import poison_testbed  # noqa: F401  (sets CUBLAS_WORKSPACE_CONFIG before torch touches CUDA)
@@ -124,6 +126,42 @@ def cmd_counterfactual(args: argparse.Namespace) -> None:
     execute(configs, ROOT / (args.out or "runs_cf"), args.jobs)
 
 
+XP1_C = 3.0552712798118593  # pinned: X signals (x_frac_clipped) stay comparable with xp1
+XP2_RUNS = 260
+XP2_BLOCK_LEN, XP2_BLOCKS = 2, 250  # decide every 2 rounds; 500 rounds as in xp1
+XP2_STICKY_P = [0.01, 0.02, 0.05, 0.1]
+XP2_REACT_DELAY = [-4, -2, 0, 1, 2, 3, 5, 8, 12]  # blocks of 2 rounds after the window start
+XP2_REACT_EXTRA = [0, 2, 5, 10]
+
+
+def xp2_config(i: int, overrides: dict) -> RunConfig:
+    """Run i of xp2: its own seed, a random window (real or phantom), and a random schedule.
+
+    Attack mix by i % 10: 0-5 windowed backdoor, 6-7 none, 8-9 continuous backdoor. Every run draws a
+    window; react schedules follow it whether or not an attack happens, so W never reveals the attack.
+    """
+    rng = np.random.default_rng(20_000 + i)  # per-run stream: adding runs never changes earlier ones
+    attack = ["backdoor_win"] * 6 + ["none"] * 2 + ["backdoor"] * 2
+    start = int(rng.integers(25, 151))
+    window = (start, start + int(rng.integers(30, 81)) - 1)
+    family = rng.choice(["sticky", "react", "on", "off"], p=[0.45, 0.45, 0.05, 0.05])
+    if family == "sticky":
+        schedule = f"sticky_p{rng.choice(XP2_STICKY_P)}"
+    elif family == "react":
+        schedule = f"react_d{rng.choice(XP2_REACT_DELAY)}_e{rng.choice(XP2_REACT_EXTRA)}"
+    else:
+        schedule = str(family)
+    params = {"C": XP1_C, "sigma": DEFAULT_SIGMA, "block_len": XP2_BLOCK_LEN, "n_blocks": XP2_BLOCKS, **overrides}
+    return RunConfig(attack=attack[i % 10], defense="Krum", seed=i, schedule=schedule, window=window, **params)
+
+
+def cmd_xp2(args: argparse.Namespace) -> None:
+    """xp2: training data that contains kills (windowed backdoor + Krum, decisions every 2 rounds)."""
+    over = parse_overrides(args.set)
+    configs = [xp2_config(i, over) for i in range(args.seeds or XP2_RUNS)]
+    execute(configs, ROOT / (args.out or "runs_xp2"), args.jobs)
+
+
 def cmd_report(args: argparse.Namespace) -> None:
     """Step 2 table: final outcomes per (attack, arm), mean ± sd over seeds, and the on − off gaps."""
     root = ROOT / (args.out or "runs_sanity")
@@ -167,7 +205,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = parser.add_subparsers(dest="cmd", required=True)
     for name, fn in [("calibrate", cmd_calibrate), ("sanity", cmd_sanity), ("collect", cmd_collect),
-                     ("counterfactual", cmd_counterfactual), ("report", cmd_report)]:
+                     ("counterfactual", cmd_counterfactual), ("xp2", cmd_xp2), ("report", cmd_report)]:
         sp = sub.add_parser(name)
         sp.set_defaults(fn=fn)
         sp.add_argument("--set", action="append", default=[], metavar="KEY=VALUE")
