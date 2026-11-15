@@ -43,11 +43,19 @@ run_counterfactual() {
   echo "== saved $(dirname "$WORK")/results_cf.zip"
 }
 
+run_xp2() {
+  echo "== xp2: windowed backdoor + Krum, decisions every 2 rounds, schedules with kills (260 runs)"
+  "$PY" -u run_experiment.py xp2 --jobs "$JOBS" $EXTRA
+  (cd "$WORK" && zip -qr "$WORK/../results_xp2.zip" runs_xp2)
+  echo "== saved $(dirname "$WORK")/results_xp2.zip"
+}
+
 SECONDS=0
 case "$STAGE" in
   sanity)         run_sanity ;;
   collect)        run_collect ;;
   all)            run_sanity; run_collect ;;
   counterfactual) run_counterfactual ;;
+  xp2)            run_xp2 ;;
 esac
 echo "== done in $((SECONDS / 60)) min"
