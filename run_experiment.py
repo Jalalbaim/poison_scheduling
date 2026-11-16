@@ -5,6 +5,7 @@
     python run_experiment.py collect [--jobs 3]        # Step 3: random Bernoulli(0.5) schedules, 20 seeds
     python run_experiment.py counterfactual            # GRU check 3: test seeds x candidate schedules
     python run_experiment.py xp2 [--jobs 4]            # xp2: windowed backdoor + Krum, data with kills
+    python run_experiment.py xp3 [--jobs 4]            # xp3: stealthy backdoors, probes, paired twins
     python run_experiment.py report                    # Step 2 table from runs_sanity/
 
 Any RunConfig field can be overridden with --set key=value (e.g. --set sigma=0.02 --set sign_flip_scale=5).
@@ -162,6 +163,73 @@ def cmd_xp2(args: argparse.Namespace) -> None:
     execute(configs, ROOT / (args.out or "runs_xp2"), args.jobs)
 
 
+XP3_MAIN, XP3_TWINS, XP3_SEED0 = 320, 80, 10_000
+XP3_ATTACKS = {  # name -> (attack, poison_frac, share)
+    "pf1/8": ("backdoor_win", 0.125, 0.35),
+    "pf2/8": ("backdoor_win", 0.25, 0.25),
+    "pf8/8": ("backdoor_win", 1.0, 0.15),
+    "none": ("none", 1.0, 0.25),
+}
+XP3_FAMILIES = {"sticky": 0.25, "react": 0.25, "probe": 0.175, "probehold": 0.175, "on": 0.075, "off": 0.075}
+XP3_STICKY_P = [0.01, 0.02, 0.05, 0.1]
+XP3_REACT_DELAY = [-4, 0, 2, 5, 10, 20, 30, 40]  # blocks (2 rounds) after the window start
+XP3_EXTRA = [0, 2, 5, 10]
+XP3_PROBE_PERIOD = [5, 10, 20, 40]  # blocks between probes (set from measure_erasure.py)
+XP3_PROBE_LEN = [1, 2, 4]  # blocks per probe
+
+
+def xp3_main_config(i: int, overrides: dict) -> RunConfig:
+    """Main run i of xp3 (seed XP3_SEED0 + i): attack, window (real or phantom) and schedule drawn per run."""
+    rng = np.random.default_rng(30_000 + i)  # per-run stream
+    names = list(XP3_ATTACKS)
+    attack, pf, _ = XP3_ATTACKS[names[rng.choice(len(names), p=[v[2] for v in XP3_ATTACKS.values()])]]
+    start = int(rng.integers(2, 21)) if rng.random() < 0.3 else int(rng.integers(21, 151))  # ~30% early
+    window = (start, start + int(rng.integers(30, 81)) - 1)
+    family = rng.choice(list(XP3_FAMILIES), p=list(XP3_FAMILIES.values()))
+    if family == "sticky":
+        schedule = f"sticky_p{rng.choice(XP3_STICKY_P)}"
+    elif family == "react":
+        schedule = f"react_d{rng.choice(XP3_REACT_DELAY)}_e{rng.choice(XP3_EXTRA)}"
+    elif family in ("probe", "probehold"):
+        period, length = int(rng.choice(XP3_PROBE_PERIOD)), int(rng.choice(XP3_PROBE_LEN))
+        length = min(length, period - 1)
+        schedule = f"probe_P{period}_L{length}_o{int(rng.integers(0, period))}"
+        if family == "probehold":
+            schedule = (f"probehold_P{period}_L{length}_o{int(rng.integers(0, period))}"
+                        f"_d{rng.choice(XP3_REACT_DELAY)}_e{rng.choice(XP3_EXTRA)}")
+    else:
+        schedule = str(family)
+    params = {"C": XP1_C, "sigma": DEFAULT_SIGMA, "block_len": XP2_BLOCK_LEN, "n_blocks": XP2_BLOCKS,
+              "always_measure_backdoor": True, **overrides}
+    return RunConfig(attack=attack, defense="Krum", seed=XP3_SEED0 + i, schedule=schedule, window=window,
+                     poison_frac=pf, **params)
+
+
+def xp3_configs(overrides: dict) -> list[RunConfig]:
+    """320 main runs + 80 paired twins. A twin = a main run with W flipped on 1-3 blocks (same seed, same data)."""
+    main = [xp3_main_config(i, overrides) for i in range(XP3_MAIN)]
+    rng = np.random.default_rng(31_000)
+    twins = []
+    for i in sorted(rng.choice(XP3_MAIN, XP3_TWINS, replace=False)):
+        base = main[i]
+        if rng.random() < 0.5:  # around the attack start, where short changes matter most
+            s = int(np.clip(base.window[0] + rng.integers(-5, 16), 0, XP2_BLOCKS - 1))
+        else:
+            s = int(rng.integers(0, XP2_BLOCKS))
+        ln = int(rng.integers(1, 4))
+        twins.append(RunConfig(**{**base.__dict__, "schedule": f"{base.schedule}+flip_s{s}_l{min(ln, XP2_BLOCKS - s)}"}))
+    return main + twins
+
+
+def cmd_xp3(args: argparse.Namespace) -> None:
+    """xp3: stealthy windowed backdoors (1/8, 2/8 poisoned), probe schedules, paired twins, backdoor measured in
+    every run."""
+    configs = xp3_configs(parse_overrides(args.set))
+    if args.seeds:
+        configs = configs[: args.seeds]
+    execute(configs, ROOT / (args.out or "runs_xp3"), args.jobs)
+
+
 def cmd_report(args: argparse.Namespace) -> None:
     """Step 2 table: final outcomes per (attack, arm), mean ± sd over seeds, and the on − off gaps."""
     root = ROOT / (args.out or "runs_sanity")
@@ -205,7 +273,8 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = parser.add_subparsers(dest="cmd", required=True)
     for name, fn in [("calibrate", cmd_calibrate), ("sanity", cmd_sanity), ("collect", cmd_collect),
-                     ("counterfactual", cmd_counterfactual), ("xp2", cmd_xp2), ("report", cmd_report)]:
+                     ("counterfactual", cmd_counterfactual), ("xp2", cmd_xp2), ("xp3", cmd_xp3),
+                     ("report", cmd_report)]:
         sp = sub.add_parser(name)
         sp.set_defaults(fn=fn)
         sp.add_argument("--set", action="append", default=[], metavar="KEY=VALUE")
