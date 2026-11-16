@@ -57,6 +57,57 @@ run_xp3() {
   echo "== saved $(dirname "$WORK")/results_xp3.zip"
 }
 
+# GRU candidates for xp3: name hidden lr weight_decay. xp1/xp2 settings (64, 2e-3, 0) overfit xp3 after 2 epochs.
+XP3_SWEEP=("a 64 5e-4 0" "b 32 5e-4 1e-3" "c 64 2e-4 1e-2" "d 128 5e-4 1e-2")
+
+find_xp3_data() {
+  if [ -n "${XP3_DATA:-}" ]; then echo "$XP3_DATA"; return; fi
+  local f
+  f=$(find /kaggle/input -path '*runs_xp3/all_blocks.csv' 2>/dev/null | head -1)
+  [ -z "$f" ] && f=$(find /kaggle/input -name all_blocks.csv 2>/dev/null | head -1)
+  if [ -z "$f" ]; then  # a zip that Kaggle did not extract
+    local z; z=$(find /kaggle/input -name 'results_xp3*.zip' 2>/dev/null | head -1)
+    if [ -n "$z" ]; then unzip -qo "$z" 'runs_xp3/all_blocks.csv' -d "$WORK/xp3_unzipped" && f="$WORK/xp3_unzipped/runs_xp3/all_blocks.csv"; fi
+  fi
+  echo "$f"
+}
+
+run_xp3_deploy() {
+  local data; data=$(find_xp3_data)
+  if [ -z "$data" ] || [ ! -f "$data" ]; then
+    echo "xp3 data not found: attach results_xp3.zip as a dataset (Add Input) or set XP3_DATA=/path/all_blocks.csv"; exit 1
+  fi
+  mkdir -p results/xp3/runs_xp3 results/xp3/gru_sweep
+  cp "$data" results/xp3/runs_xp3/all_blocks.csv
+  "$PY" - <<'PYCHECK'
+import pandas as pd
+d = pd.read_csv("results/xp3/runs_xp3/all_blocks.csv")
+n = d.run_id.nunique(); rows = d.groupby("run_id").size().unique()
+print(f"xp3 data: {n} runs, rows per run {rows}")
+if n != 400 or list(rows) != [251]:
+    raise SystemExit("unexpected xp3 data: expected 400 runs x 251 rows")
+PYCHECK
+  echo "== xp3_deploy 1/3: GRU sweep on xp3 (${#XP3_SWEEP[@]} models, one at a time)"
+  for cfg in "${XP3_SWEEP[@]}"; do
+    set -- $cfg
+    if [ -f "results/xp3/gru_sweep/$1/report.json" ]; then echo "   model $1 already trained"; continue; fi
+    rm -rf "results/xp3/gru_sweep/$1"
+    echo "   model $1: hidden $2, lr $3, weight decay $4"
+    "$PY" -u gru_experiment.py --runs results/xp3/runs_xp3/all_blocks.csv --out "results/xp3/gru_sweep/$1" \
+      --hidden "$2" --lr "$3" --wd "$4" --patience 40 > "results/xp3/gru_sweep/$1.log" 2>&1 \
+      || { echo "   model $1 failed:"; tail -20 "results/xp3/gru_sweep/$1.log"; exit 1; }
+    grep -E "^model:" "results/xp3/gru_sweep/$1.log"
+  done
+  echo "== xp3_deploy 2/3: model selection on validation seeds (check P: hold vs keep probing)"
+  "$PY" -u check_probe.py --select results/xp3/gru_sweep/a results/xp3/gru_sweep/b results/xp3/gru_sweep/c results/xp3/gru_sweep/d
+  local sel; sel=$("$PY" -c "import json; print(json.load(open('results/xp3/gru_selected.json'))['selected'])")
+  echo "== xp3_deploy 3/3: deployment with $sel (6 policies x 4 conditions x 4 seeds = 96 runs)"
+  "$PY" -u deploy_xp3.py --gru "$sel" --jobs "$JOBS" | tee results/deploy_xp3_log.txt
+  (cd "$WORK" && zip -qr "$WORK/../xp3_deploy.zip" results/xp3/gru_sweep results/xp3/gru_selected.json \
+     results/deploy_xp3 results/deploy_xp3_log.txt)
+  echo "== saved $(dirname "$WORK")/xp3_deploy.zip"
+}
+
 SECONDS=0
 case "$STAGE" in
   sanity)         run_sanity ;;
@@ -65,5 +116,6 @@ case "$STAGE" in
   counterfactual) run_counterfactual ;;
   xp2)            run_xp2 ;;
   xp3)            run_xp3 ;;
+  xp3_deploy)     run_xp3_deploy ;;
 esac
 echo "== done in $((SECONDS / 60)) min"

@@ -9,11 +9,15 @@
 #     !bash run_kaggle.sh counterfactual   # GRU check 3: 384 runs, test seeds x candidate schedules
 #     !bash run_kaggle.sh xp2              # xp2: 260 runs, windowed backdoor + Krum, data with kills
 #     !bash run_kaggle.sh xp3              # xp3: 400 runs, stealthy backdoors, probes, paired twins
+#     !bash run_kaggle.sh xp3_deploy       # GRU sweep on xp3 + model selection + deployment (96 runs)
+#                                          #   needs results_xp3.zip attached as a Kaggle dataset (Add Input)
+#                                          #   -> /kaggle/working/xp3_deploy.zip
 #
 # Optional environment variables:
 #     JOBS=4          parallel runs (default: number of CPUs)
 #     WORK=/path      output folder (default: /kaggle/working/testbed)
 #     EXTRA="--set sigma=0.02 --set sign_flip_scale=5"   config overrides for sanity/collect
+#     XP3_DATA=/path/all_blocks.csv   xp3 data for xp3_deploy (default: searched in /kaggle/input)
 #
 # Re-running a stage skips runs that already finished with the same config,
 # so an interrupted stage can simply be started again (same session).
@@ -23,7 +27,7 @@
 set -euo pipefail
 
 STAGE="${1:-sanity}"
-case "$STAGE" in sanity|collect|all|counterfactual|xp2|xp3) ;; *) echo "usage: $0 [sanity|collect|all|counterfactual|xp2|xp3]"; exit 2;; esac
+case "$STAGE" in sanity|collect|all|counterfactual|xp2|xp3|xp3_deploy) ;; *) echo "usage: $0 [sanity|collect|all|counterfactual|xp2|xp3|xp3_deploy]"; exit 2;; esac
 if [ -d /kaggle/working ]; then DEFAULT_WORK=/kaggle/working/testbed; else DEFAULT_WORK="$PWD/testbed"; fi
 WORK="${WORK:-$DEFAULT_WORK}"
 JOBS="${JOBS:-$(nproc)}"
@@ -1230,6 +1234,1463 @@ def test_no_attack_uses_all_workers_honestly():
     cols = [c for c in a.columns if c.startswith(("x_", "y_clean"))]
     pd.testing.assert_frame_equal(a[cols], b[cols])
 __KRUM_TESTBED_EOF__
+cat > analyze.py <<'__KRUM_TESTBED_EOF__'
+"""Step 4: causal analysis of the randomized-defense logs.
+
+    python analyze.py --runs results/xp1/results_collect/runs/all_blocks.csv --out results/xp1/analysis
+
+Q1  When does defending matter?
+    (i)  one-step effect: per block b and condition, regress Y[b] - Y[b-1] on W[b]
+         (= difference in means, W is a single binary regressor); also pooled by phase.
+    (ii) final effect: regress Y[49] on the fraction of defended blocks in 5 phases of 10.
+    Bootstrap CIs resample runs (not rows) within each condition.
+Q2  Does the one-step effect depend on history X, or only on time (and lr)?
+    Ridge regression of Y[b] - Y[b-1] on W, time, W x time, X[b-1]  (M0)
+    versus M0 + W x X[b-1]  (M1). Held-out MSE, 5-fold split by run.
+Q3  Can the attack be detected from X alone? Logistic regression X[b] -> u_active[b],
+    AUC per attack type (and per defense), 5-fold split by seed.
+Outputs: figures (PNG), tables (CSV), summary.md.
+"""
+
+import argparse
+from pathlib import Path
+
+import matplotlib
+
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt  # noqa: E402
+import numpy as np  # noqa: E402
+import pandas as pd  # noqa: E402
+from matplotlib.colors import LinearSegmentedColormap  # noqa: E402
+from sklearn.linear_model import LogisticRegression, Ridge  # noqa: E402
+from sklearn.metrics import roc_auc_score  # noqa: E402
+from sklearn.model_selection import GroupKFold  # noqa: E402
+from sklearn.pipeline import make_pipeline  # noqa: E402
+from sklearn.preprocessing import StandardScaler  # noqa: E402
+
+ATTACKS = ["none", "label_flip", "backdoor", "backdoor_win", "alie", "sign_flip"]
+DEFENSES = ["ClipNoise", "Krum", "MultiKrum", "Median", "TrimmedMean", "Bulyan"]
+X_COLS = ["x_norm_mean", "x_norm_std", "x_pdist_mean", "x_maxdist_median", "x_cos_avg_median",
+          "x_frac_clipped", "x_train_loss", "x_val_acc"]
+OUTCOMES = {"y_clean_acc": "clean accuracy", "y_atk": "backdoor success"}
+N_PHASES = 5
+
+# Reference palette (validated: light surface, categorical slots 1-6; contrast WARN -> legends + tables).
+SURFACE, INK, INK2, GRID = "#fcfcfb", "#0b0b0b", "#52514e", "#e4e3df"
+SERIES = dict(zip(DEFENSES, ["#2a78d6", "#eb6834", "#1baf7a", "#eda100", "#e87ba4", "#008300"]))
+DIVERGING = LinearSegmentedColormap.from_list("div", ["#e34948", "#f0efec", "#2a78d6"])
+SEQUENTIAL = LinearSegmentedColormap.from_list("seq", ["#f0efec", "#86b6ef", "#2a78d6", "#104281"])
+
+plt.rcParams.update({
+    "figure.facecolor": SURFACE, "axes.facecolor": SURFACE, "savefig.facecolor": SURFACE,
+    "axes.edgecolor": GRID, "axes.labelcolor": INK2, "xtick.color": INK2, "ytick.color": INK2,
+    "text.color": INK, "axes.grid": True, "grid.color": GRID, "grid.linewidth": 0.6,
+    "axes.spines.top": False, "axes.spines.right": False, "font.size": 9, "axes.titlesize": 9,
+    "lines.linewidth": 1.6, "legend.frameon": False,
+})
+
+
+# ----------------------------------------------------------------------------- data
+def load(path: Path) -> pd.DataFrame:
+    df = pd.read_csv(path).sort_values(["run_id", "block"]).reset_index(drop=True)
+    sizes = df.groupby("run_id").size()
+    if sizes.nunique() != 1:
+        raise SystemExit(f"runs have different lengths: {sizes.value_counts().to_dict()}")
+    return df
+
+
+def panel(df: pd.DataFrame, attack: str, defense: str, y: str) -> dict[str, np.ndarray]:
+    """Arrays for one condition: Y (R, B+1) incl. block -1, W (R, B), X (R, B, k) for blocks 0..B-1."""
+    sub = df[(df.attack == attack) & (df.defense == defense)]
+    runs = sorted(sub.run_id.unique())
+    sub = sub.set_index(["run_id", "block"]).sort_index()
+    Y = sub[y].unstack("block").loc[runs].to_numpy(float)
+    W = sub["W"].unstack("block").loc[runs].drop(columns=-1).to_numpy(float)
+    X = np.stack([sub[c].unstack("block").loc[runs].drop(columns=-1).to_numpy(float) for c in X_COLS], axis=2)
+    seeds = sub["seed"].groupby("run_id").first().loc[runs].to_numpy()
+    return {"Y": Y, "W": W, "X": X, "seeds": seeds, "runs": np.array(runs)}
+
+
+def conditions(df: pd.DataFrame, y: str) -> list[tuple[str, str]]:
+    have = df.groupby(["attack", "defense"])[y].apply(lambda s: s.notna().any())
+    return [(a, d) for a in ATTACKS for d in DEFENSES if have.get((a, d), False)]
+
+
+# ----------------------------------------------------------------------------- Q1
+def diff_in_means(D: np.ndarray, W: np.ndarray) -> np.ndarray:
+    """Per-column E[D | W=1] - E[D | W=0]; works on (..., R, B) arrays."""
+    on, off = W.sum(-2), (1 - W).sum(-2)
+    with np.errstate(invalid="ignore", divide="ignore"):
+        return (D * W).sum(-2) / on - (D * (1 - W)).sum(-2) / off
+
+
+def q1(df: pd.DataFrame, y: str, n_boot: int, rng: np.random.Generator) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    step_rows, phase_rows, final_rows = [], [], []
+    for attack, defense in conditions(df, y):
+        p = panel(df, attack, defense, y)
+        D, W, Y = np.diff(p["Y"], axis=1), p["W"], p["Y"]
+        R, B = W.shape
+        per_phase = B // N_PHASES
+        idx = rng.integers(0, R, size=(n_boot, R))
+
+        est = diff_in_means(D, W)
+        boot = diff_in_means(D[idx], W[idx])  # (n_boot, B)
+        lo, hi = np.nanpercentile(boot, [2.5, 97.5], axis=0)
+        for b in range(B):
+            step_rows.append((attack, defense, b, est[b], lo[b], hi[b]))
+
+        ph = est.reshape(N_PHASES, per_phase).mean(1)
+        ph_boot = np.nanmean(boot.reshape(n_boot, N_PHASES, per_phase), axis=2)
+        plo, phi = np.nanpercentile(ph_boot, [2.5, 97.5], axis=0)
+        for k in range(N_PHASES):
+            phase_rows.append((attack, defense, k + 1, ph[k], plo[k], phi[k]))
+
+        F = W.reshape(R, N_PHASES, per_phase).mean(2)
+        A = np.column_stack([np.ones(R), F])
+        beta = np.linalg.lstsq(A, Y[:, -1], rcond=None)[0]
+        bb = np.array([np.linalg.lstsq(A[i], Y[i, -1], rcond=None)[0] for i in idx])
+        blo, bhi = np.percentile(bb, [2.5, 97.5], axis=0)
+        for k in range(N_PHASES):
+            final_rows.append((attack, defense, k + 1, beta[k + 1], blo[k + 1], bhi[k + 1]))
+
+    cols = ["attack", "defense"]
+    return (pd.DataFrame(step_rows, columns=[*cols, "block", "effect", "lo", "hi"]),
+            pd.DataFrame(phase_rows, columns=[*cols, "phase", "effect", "lo", "hi"]),
+            pd.DataFrame(final_rows, columns=[*cols, "phase", "effect", "lo", "hi"]))
+
+
+# ----------------------------------------------------------------------------- Q2
+def q2_design(p: dict[str, np.ndarray]) -> tuple[dict[str, np.ndarray], np.ndarray, np.ndarray]:
+    """Rows (run, b) for b = 1..B-1: target Y[b]-Y[b-1], treatment W[b], history X[b-1]."""
+    D = np.diff(p["Y"], axis=1)  # D[:, b] = Y[b] - Y[b-1], b = 0..B-1
+    R, B = p["W"].shape
+    b = np.arange(1, B)
+    t = np.tile((b - B / 2) / (B / 2), R)
+    T = np.column_stack([t, t**2, t**3])
+    w = p["W"][:, 1:].reshape(-1, 1)
+    X = p["X"][:, :-1, :].reshape(-1, len(X_COLS))
+    X = (X - X.mean(0)) / X.std(0).clip(1e-12)
+    designs = {
+        "base (no W)": np.column_stack([T, X]),
+        "M0: W x time": np.column_stack([w, T, w * T, X]),
+        "M1: + W x X": np.column_stack([w, T, w * T, X, w * X]),
+    }
+    groups = np.repeat(np.arange(R), B - 1)
+    return designs, D[:, 1:].reshape(-1), groups
+
+
+def q2(df: pd.DataFrame, y: str) -> pd.DataFrame:
+    rows = []
+    for attack, defense in conditions(df, y):
+        designs, target, groups = q2_design(panel(df, attack, defense, y))
+        fold_mse = {name: [] for name in designs}
+        for tr, te in GroupKFold(n_splits=5).split(target, groups=groups):
+            for name, A in designs.items():
+                model = make_pipeline(StandardScaler(), Ridge(alpha=1.0)).fit(A[tr], target[tr])
+                fold_mse[name].append(np.mean((model.predict(A[te]) - target[te]) ** 2))
+        m = {k: np.array(v) for k, v in fold_mse.items()}
+        gain = m["M0: W x time"] - m["M1: + W x X"]  # > 0: interactions help out of sample
+        w_gain = m["base (no W)"] - m["M0: W x time"]
+        rows.append({
+            "attack": attack, "defense": defense,
+            "mse_base": m["base (no W)"].mean(), "mse_M0": m["M0: W x time"].mean(), "mse_M1": m["M1: + W x X"].mean(),
+            "rel_gain_M1_vs_M0": 1 - m["M1: + W x X"].mean() / m["M0: W x time"].mean(),
+            "gain_se": gain.std(ddof=1) / np.sqrt(len(gain)),
+            "gain_mean": gain.mean(),
+            "rel_gain_W": 1 - m["M0: W x time"].mean() / m["base (no W)"].mean(),
+            "w_gain_mean": w_gain.mean(), "w_gain_se": w_gain.std(ddof=1) / np.sqrt(len(w_gain)),
+        })
+    return pd.DataFrame(rows)
+
+
+# ----------------------------------------------------------------------------- Q3
+def q3(df: pd.DataFrame) -> pd.DataFrame:
+    trained = df[df.block >= 0]
+
+    def auc(frame: pd.DataFrame) -> float:
+        Xm, u, g = frame[X_COLS].to_numpy(float), frame.u_active.to_numpy(int), frame.seed.to_numpy()
+        if u.min() == u.max():
+            return np.nan
+        scores = np.zeros(len(u))
+        for tr, te in GroupKFold(n_splits=5).split(Xm, groups=g):
+            model = make_pipeline(StandardScaler(), LogisticRegression(max_iter=2000)).fit(Xm[tr], u[tr])
+            scores[te] = model.predict_proba(Xm[te])[:, 1]
+        return roc_auc_score(u, scores)
+
+    rows = []
+    for attack in ATTACKS[1:]:
+        both = trained[trained.attack.isin(["none", attack])]
+        rows.append({"attack": attack, "defense": "all", "auc": auc(both)})
+        for defense in DEFENSES:
+            rows.append({"attack": attack, "defense": defense, "auc": auc(both[both.defense == defense])})
+    rows.append({"attack": "any", "defense": "all", "auc": auc(trained)})
+    return pd.DataFrame(rows)
+
+
+# ----------------------------------------------------------------------------- figures
+def fig_onestep(step: pd.DataFrame, phase: pd.DataFrame, y: str, out: Path) -> None:
+    attacks = [a for a in ATTACKS if a in set(step.attack)]
+    fig, axes = plt.subplots(len(attacks), len(DEFENSES), figsize=(15, 2.0 * len(attacks) + 0.8),
+                             sharex=True, sharey="row", squeeze=False)
+    for i, attack in enumerate(attacks):
+        for j, defense in enumerate(DEFENSES):
+            ax = axes[i, j]
+            s = step[(step.attack == attack) & (step.defense == defense)]
+            ph = phase[(phase.attack == attack) & (phase.defense == defense)]
+            color = SERIES[defense]
+            ax.axhline(0, color=INK2, linewidth=0.8)
+            ax.fill_between(s.block, s.lo, s.hi, color=color, alpha=0.15, linewidth=0)
+            ax.plot(s.block, s.effect, color=color, linewidth=1.0, alpha=0.7)
+            for _, r in ph.iterrows():  # phase-pooled estimate as a step
+                x0, x1 = (r.phase - 1) * 10 - 0.5, r.phase * 10 - 0.5
+                ax.plot([x0, x1], [r.effect, r.effect], color=INK, linewidth=2.0)
+            if i == 0:
+                ax.set_title(defense, color=INK, fontweight="bold")
+            if j == 0:
+                ax.set_ylabel(f"{attack}\nΔ {OUTCOMES[y]}")
+            if i == len(attacks) - 1:
+                ax.set_xlabel("block")
+    fig.suptitle(f"Q1(i) One-step effect of defending block b on {OUTCOMES[y]}:  "
+                 f"E[Y_b − Y_(b−1) | W_b=1] − E[· | W_b=0].  Thin line + band: per block, 95% bootstrap CI "
+                 f"(runs resampled).  Black: pooled per phase of 10 blocks.", fontsize=9, color=INK, x=0.01, ha="left")
+    fig.tight_layout(rect=(0, 0, 1, 0.97))
+    fig.savefig(out / f"q1_onestep_{y}.png", dpi=130)
+    plt.close(fig)
+
+
+def fig_final(final: pd.DataFrame, y: str, out: Path) -> None:
+    attacks = [a for a in ATTACKS if a in set(final.attack)]
+    cols = min(3, len(attacks))
+    rows = int(np.ceil(len(attacks) / cols))
+    fig, axes = plt.subplots(rows, cols, figsize=(4.6 * cols, 3.0 * rows + 0.6), squeeze=False)
+    offsets = np.linspace(-0.25, 0.25, len(DEFENSES))
+    for k, attack in enumerate(attacks):
+        ax = axes[k // cols, k % cols]
+        ax.axhline(0, color=INK2, linewidth=0.8)
+        for off, defense in zip(offsets, DEFENSES):
+            s = final[(final.attack == attack) & (final.defense == defense)]
+            ax.errorbar(s.phase + off, s.effect, yerr=[s.effect - s.lo, s.hi - s.effect], color=SERIES[defense],
+                        marker="o", markersize=4, linewidth=1.4, capsize=0, label=defense)
+        ax.set_title(attack, color=INK, fontweight="bold")
+        ax.set_xticks(range(1, N_PHASES + 1), [f"{10 * (p - 1)}–{10 * p - 1}" for p in range(1, N_PHASES + 1)])
+        ax.set_xlabel("phase (blocks)")
+        ax.set_ylabel(f"Δ final {OUTCOMES[y]}")
+    for k in range(len(attacks), rows * cols):
+        axes[k // cols, k % cols].set_visible(False)
+    handles, labels = axes[0, 0].get_legend_handles_labels()
+    fig.legend(handles, labels, loc="upper right", ncol=len(DEFENSES), fontsize=8)
+    fig.suptitle(f"Q1(ii) Effect on final {OUTCOMES[y]} of defending a whole phase (vs never), "
+                 f"OLS on phase fractions; 95% bootstrap CI", fontsize=9, color=INK, x=0.01, ha="left")
+    fig.tight_layout(rect=(0, 0, 1, 0.93))
+    fig.savefig(out / f"q1_final_{y}.png", dpi=130)
+    plt.close(fig)
+
+
+def heatmap(ax, table: pd.DataFrame, cmap, vmin: float, vmax: float, fmt: str, title: str) -> None:
+    im = ax.imshow(table.to_numpy(float), cmap=cmap, vmin=vmin, vmax=vmax, aspect="auto")
+    ax.set_xticks(range(table.shape[1]), table.columns, rotation=0)
+    ax.set_yticks(range(table.shape[0]), table.index)
+    ax.grid(False)
+    for (i, j), v in np.ndenumerate(table.to_numpy(float)):
+        if not np.isnan(v):
+            ax.text(j, i, format(v, fmt), ha="center", va="center", fontsize=8, color=INK)
+    ax.set_title(title, color=INK, loc="left")
+    return im
+
+
+def fig_q2(q2s: dict[str, pd.DataFrame], out: Path) -> None:
+    fig, axes = plt.subplots(len(q2s), 1, figsize=(9, 2.6 * len(q2s) + 0.4), squeeze=False)
+    for ax, (y, t) in zip(axes[:, 0], q2s.items()):
+        # Cell = gain of M1 over M0 in units of its fold standard error (|z| > 2 ~ significant).
+        z = (t.gain_mean / t.gain_se).to_numpy()
+        tab = pd.DataFrame({"attack": t.attack, "defense": t.defense, "z": z}).pivot(
+            index="attack", columns="defense", values="z").reindex(
+            index=[a for a in ATTACKS if a in set(t.attack)], columns=DEFENSES)
+        im = heatmap(ax, tab, DIVERGING, -4, 4, "+.1f",
+                     f"{OUTCOMES[y]}: held-out MSE gain of M1 (+ W×X) over M0 (W×time), in fold-SE units")
+        fig.colorbar(im, ax=ax, shrink=0.8, label="z  (>0: history helps)")
+    fig.tight_layout()
+    fig.savefig(out / "q2_interactions.png", dpi=130)
+    plt.close(fig)
+
+
+def fig_q3(t: pd.DataFrame, out: Path) -> None:
+    tab = t[t.attack != "any"].pivot(index="attack", columns="defense", values="auc").reindex(
+        index=ATTACKS[1:], columns=["all", *DEFENSES])
+    fig, ax = plt.subplots(figsize=(9, 3.2))
+    im = heatmap(ax, tab, SEQUENTIAL, 0.5, 1.0, ".2f",
+                 "Q3  Detecting an active attack from X alone: held-out AUC (split by seed)")
+    fig.colorbar(im, ax=ax, shrink=0.8, label="AUC")
+    fig.tight_layout()
+    fig.savefig(out / "q3_detection_auc.png", dpi=130)
+    plt.close(fig)
+
+
+# ----------------------------------------------------------------------------- summary
+def fmt_ci(r: pd.Series, scale: float = 100) -> str:
+    return f"{scale * r.effect:+.1f} [{scale * r.lo:+.1f}, {scale * r.hi:+.1f}]"
+
+
+def summary(df: pd.DataFrame, res: dict, out: Path) -> str:
+    n_runs = df.run_id.nunique()
+    per_cond = df.groupby(["attack", "defense"]).run_id.nunique()
+    shared = df[df.block >= 0].groupby("seed").apply(lambda g: g.groupby("run_id").W.apply(tuple).nunique()).max()
+    L = [
+        "# Step 4 summary: randomized defense schedules",
+        "",
+        f"Data: {n_runs} runs, {per_cond.min()}–{per_cond.max()} runs per (attack, defense), "
+        f"{df.block.max() + 1} blocks per run. Effects are in **percentage points**; brackets are 95% bootstrap "
+        "CIs resampling runs.",
+        "",
+        "Design note: the schedule seed is `1000 + seed`, so a given seed has the same W schedule in every "
+        f"condition (max distinct schedules per seed: {shared}). Within a condition the 20 schedules are "
+        "independent, which is what every estimate below relies on; conditions are not independent replicates "
+        "of each other.",
+        "",
+    ]
+
+    # Q1 ---------------------------------------------------------------------
+    L += ["## Q1. When does defending matter?", ""]
+    for y in res["q1"]:
+        final = res["q1"][y][2]
+        L += [f"### Final {OUTCOMES[y]}: effect of defending a whole phase (vs never)", "",
+              "| attack | defense | " + " | ".join(f"blocks {10 * (p - 1)}–{10 * p - 1}" for p in range(1, 6)) + " |",
+              "|---|---|" + "---|" * 5]
+        for (a, d), g in final.groupby(["attack", "defense"], sort=False):
+            cells = []
+            for _, r in g.sort_values("phase").iterrows():
+                sig = (r.lo > 0) or (r.hi < 0)
+                cells.append(("**" + fmt_ci(r) + "**") if sig else fmt_ci(r))
+            L.append(f"| {a} | {d} | " + " | ".join(cells) + " |")
+        L += ["", "Bold: CI excludes 0.", ""]
+        phase = res["q1"][y][1]
+        top = phase.assign(sig=(phase.lo > 0) | (phase.hi < 0))
+        n_sig = int(top.sig.sum())
+        L += [f"One-step effect on {OUTCOMES[y]} (pooled per phase): {n_sig} of {len(top)} (condition, phase) "
+              "cells have a CI excluding 0. Largest effects:", ""]
+        for _, r in top.reindex(top.effect.abs().sort_values(ascending=False).index).head(6).iterrows():
+            L.append(f"- {r.attack} / {r.defense}, phase {r.phase}: {fmt_ci(r, 100)} pts per defended block")
+        L.append("")
+
+    # Q2 ---------------------------------------------------------------------
+    L += ["## Q2. Does the effect depend on history X?", "",
+          "M0 lets the effect of W vary with time only (W × cubic in block; lr is constant in this "
+          "dataset, so it cannot be separated from time). M1 adds W × X[b−1]. Held-out MSE, 5 folds split "
+          "by run. z = mean fold gain / its standard error.", ""]
+    for y, t in res["q2"].items():
+        z = t.gain_mean / t.gain_se
+        zw = t.w_gain_mean / t.w_gain_se
+        L += [f"**{OUTCOMES[y]}**: W itself improves held-out error (z > 2) in {int((zw > 2).sum())}/{len(t)} "
+              f"conditions. Adding W × X improves it (z > 2) in {int((z > 2).sum())}/{len(t)}, "
+              f"hurts (z < −2) in {int((z < -2).sum())}/{len(t)}; median relative MSE change "
+              f"{100 * t.rel_gain_M1_vs_M0.median():+.2f}%.", ""]
+        best = t.assign(z=z).sort_values("z", ascending=False).head(5)
+        L += ["| attack | defense | MSE gain from W (%) | MSE gain from W×X (%) | z (W×X) |", "|---|---|---|---|---|"]
+        for _, r in best.iterrows():
+            L.append(f"| {r.attack} | {r.defense} | {100 * r.rel_gain_W:+.2f} | {100 * r.rel_gain_M1_vs_M0:+.2f} | "
+                     f"{r.z:+.1f} |")
+        L.append("")
+
+    # Q3 ---------------------------------------------------------------------
+    t = res["q3"]
+    L += ["## Q3. Can an attack be detected from X alone?", "",
+          "Logistic regression X[b] → u_active[b] on the attacked runs plus the no-attack runs; "
+          "held-out AUC with 5 folds split by seed (a seed's runs are never in train and test at once).", "",
+          "| attack | all defenses | " + " | ".join(DEFENSES) + " |", "|---|---|" + "---|" * len(DEFENSES)]
+    for a in ATTACKS[1:]:
+        g = t[t.attack == a].set_index("defense").auc
+        L.append(f"| {a} | **{g['all']:.3f}** | " + " | ".join(f"{g[d]:.3f}" for d in DEFENSES) + " |")
+    L += ["", f"Any attack vs none, all conditions pooled: AUC {t[t.attack == 'any'].auc.iloc[0]:.3f}.", ""]
+
+    L += ["## Files", "",
+          "- `q1_onestep_<y>.png`, `q1_final_<y>.png`, `q2_interactions.png`, `q3_detection_auc.png`",
+          "- tables: `q1_onestep_<y>.csv`, `q1_phase_<y>.csv`, `q1_final_<y>.csv`, `q2_<y>.csv`, `q3.csv`", ""]
+    text = "\n".join(L)
+    (out / "summary.md").write_text(text, encoding="utf-8")
+    return text
+
+
+def main() -> None:
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--runs", type=Path, default=Path("results/xp1/results_collect/runs/all_blocks.csv"))
+    ap.add_argument("--out", type=Path, default=Path("results/xp1/analysis"))
+    ap.add_argument("--boot", type=int, default=1000)
+    ap.add_argument("--seed", type=int, default=0)
+    args = ap.parse_args()
+    args.out.mkdir(parents=True, exist_ok=True)
+    rng = np.random.default_rng(args.seed)
+    df = load(args.runs)
+
+    res: dict = {"q1": {}, "q2": {}}
+    for y in OUTCOMES:
+        step, phase, final = q1(df, y, args.boot, rng)
+        res["q1"][y] = (step, phase, final)
+        step.to_csv(args.out / f"q1_onestep_{y}.csv", index=False)
+        phase.to_csv(args.out / f"q1_phase_{y}.csv", index=False)
+        final.to_csv(args.out / f"q1_final_{y}.csv", index=False)
+        fig_onestep(step, phase, y, args.out)
+        fig_final(final, y, args.out)
+        res["q2"][y] = q2(df, y)
+        res["q2"][y].to_csv(args.out / f"q2_{y}.csv", index=False)
+        print(f"done {y}", flush=True)
+    fig_q2(res["q2"], args.out)
+    res["q3"] = q3(df)
+    res["q3"].to_csv(args.out / "q3.csv", index=False)
+    fig_q3(res["q3"], args.out)
+    import sys
+    sys.stdout.reconfigure(encoding="utf-8")
+    print(summary(df, res, args.out))
+
+
+if __name__ == "__main__":
+    main()
+__KRUM_TESTBED_EOF__
+cat > gru_experiment.py <<'__KRUM_TESTBED_EOF__'
+"""GRU outcome model: predict future outcomes under a candidate defense schedule.
+
+    python gru_experiment.py                                    # xp1 (frozen model in results/xp1/gru)
+    python gru_experiment.py --cf runs_cf/all_blocks.csv        # xp1 + check 3 against true counterfactual runs
+    python gru_experiment.py --runs results/xp2/runs_xp2/all_blocks.csv --out results/xp2/gru   # xp2
+
+Model. An encoder GRU reads the observable history up to block b: the signals X
+(incl. validation accuracy), the defense flag W, time and the defense type. A
+decoder GRU, started from the encoder state, reads the candidate future
+schedule W[b+1:] and outputs y_clean_acc and y_atk for every future block.
+Inputs never include U (attack type / activity), Y_clean or Y_atk: the attack
+must be inferred from X. Future X is not predicted (no feedback of errors).
+
+The run length is read from the data (xp1: 50 blocks of 10 rounds; xp2: 250
+blocks of 2 rounds). Training samples CUTS_PER_BATCH cut points per batch
+(all of them when a run has fewer cuts).
+
+Split by seed, stratified by attack (see assign_splits): 70% train, 10%
+validation (early stopping), 20% test. For xp1 (seeds 0-19 in every
+condition) this is train 0-13 / val 14-15 / test 16-19.
+
+Check 1  Prediction error on test seeds, by horizon, vs baselines.
+Check 2  (xp1-shaped data only) GRU-implied one-step effect of W vs the
+         randomized Q1 estimate (analyze.py).
+Check K  (windowed attacks) Kill awareness: from the history up to the attack's
+         first block, does the GRU predict that defending from now on keeps the
+         backdoor out, and that not defending implants it?
+Check 3  (xp1, --cf) Counterfactual reruns. The model is frozen once trained
+         (weights hash in report.json); --cf only loads it, never retrains.
+"""
+
+import argparse
+import hashlib
+import json
+import re
+import sys
+from pathlib import Path
+
+import matplotlib
+
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt 
+import numpy as np 
+import pandas as pd 
+import torch 
+from torch import nn 
+
+import analyze 
+from analyze import DEFENSES, INK, INK2, SERIES, X_COLS 
+
+Y_COLS = ["y_clean_acc", "y_atk"]
+CF_PREFIX = 3
+CUTS_PER_BATCH = 16
+MAX_RIDGE_PAIRS = 1_000_000
+
+
+def assign_splits(df: pd.DataFrame) -> pd.Series:
+    """Split by seed, stratified by attack: rank each attack's seeds, then rank % 20 in 0-13 train, 14-15 val,
+    16-19 test (70/10/20).
+
+    xp1: each attack has seeds 0-19, so rank = seed (train 0-13, val 14-15, test 16-19, as before).
+    xp2: the attack is set by seed % 10, so a plain seed % 20 rule would leave the windowed attack out of
+    the test set; ranking within each attack keeps every attack in every split. The attack label is used
+    for stratification only, never as a model input.
+    """
+    split = pd.Series(index=df.index, dtype=object)
+    # xp3 logs the poison rate: stratify by it too, so every rate is in every split (xp1/xp2: attack only).
+    keys = ["attack", "poison_frac"] if "poison_frac" in df else ["attack"]
+    for _, g in df.groupby(keys):
+        rank = {s: k for k, s in enumerate(sorted(g.seed.unique()))}
+        r = g.seed.map(rank) % 20
+        split[g.index] = np.where(r < 14, "train", np.where(r < 16, "val", "test"))
+    return split
+
+
+def horizons(n_blocks: int) -> list[int]:
+    return [1, 5, n_blocks // 5, n_blocks // 2]  # xp1: 1, 5, 10, 25
+
+
+# ----------------------------------------------------------------------------- tensors
+class Data:
+    """Per-run tensors. Row i is block i-1 (row 0 = initial state); n_rows = n_blocks + 1."""
+
+    def __init__(self, df: pd.DataFrame, x_mean: np.ndarray | None = None, x_std: np.ndarray | None = None):
+        df = df.sort_values(["run_id", "block"])
+        runs = df.groupby("run_id", sort=True)
+        sizes = runs.size()
+        if sizes.nunique() != 1:
+            raise ValueError(f"runs have different lengths: {sizes.value_counts().to_dict()}")
+        meta = runs.first()[["seed", "attack", "defense"]]
+        self.run_ids = meta.index.to_numpy()
+        self.seed = meta.seed.to_numpy()
+        self.attack = meta.attack.to_numpy()
+        self.defense = meta.defense.to_numpy()
+        R, n = len(meta), int(sizes.iloc[0])
+        self.n_rows, self.n_blocks = n, n - 1
+        X = df[X_COLS].to_numpy(float).reshape(R, n, len(X_COLS))
+        if x_mean is None:
+            x_mean, x_std = np.nanmean(X[:, 1:], axis=(0, 1)), np.nanstd(X[:, 1:], axis=(0, 1))
+        self.x_mean, self.x_std = x_mean, x_std
+        X = np.nan_to_num((X - x_mean) / x_std)  # row 0 (init) -> 0, flagged below
+        W = np.nan_to_num(df.W.to_numpy(float).reshape(R, n))
+        t = np.broadcast_to((np.arange(n) - 1) / self.n_blocks, (R, n))
+        init = np.zeros((R, n)); init[:, 0] = 1
+        D = np.stack([self.defense == d for d in DEFENSES], 1).astype(float)  # (R, 6)
+        Dr = np.broadcast_to(D[:, None, :], (R, n, len(DEFENSES)))
+        self.W = W
+        self.enc = torch.tensor(np.concatenate([X, W[..., None], t[..., None], init[..., None], Dr], -1),
+                                dtype=torch.float32)
+        self.D = torch.tensor(D, dtype=torch.float32)
+        Y = df[Y_COLS].to_numpy(float).reshape(R, n, 2)
+        self.Y = torch.tensor(np.nan_to_num(Y), dtype=torch.float32)
+        self.Ymask = torch.tensor(~np.isnan(Y), dtype=torch.float32)
+        # Attack activity per block: an evaluation label only (never a model input).
+        self.U = df.u_active.to_numpy(float).reshape(R, n) if "u_active" in df else None
+
+    def dec_inputs(self, W: np.ndarray | torch.Tensor, runs: slice | None = None) -> torch.Tensor:
+        """Decoder inputs for rows 1..n-1 given a schedule W (R, n): [W, t, defense one-hot].
+
+        ``runs`` selects whose defense one-hot to use; by default W has one row per run of this Data (or this
+        Data holds a single run, whose one-hot is shared by every row of W, e.g. several candidate plans).
+        """
+        W = torch.as_tensor(np.asarray(W, float), dtype=torch.float32)
+        R, n = W.shape[0], self.n_rows
+        D = self.D if runs is None else self.D[runs]
+        t = ((torch.arange(1, n) - 1) / self.n_blocks).expand(R, -1)
+        return torch.cat([W[:, 1:, None], t[..., None], D[:, None, :].expand(R, n - 1, -1)], -1)
+
+
+# ----------------------------------------------------------------------------- model
+class OutcomeGRU(nn.Module):
+    def __init__(self, enc_dim: int, dec_dim: int, hidden: int = 64):
+        super().__init__()
+        self.enc = nn.GRU(enc_dim, hidden, batch_first=True)
+        self.dec = nn.GRU(dec_dim, hidden, batch_first=True)
+        self.head = nn.Linear(hidden, 2)
+
+    def encode(self, enc_x: torch.Tensor) -> torch.Tensor:
+        return self.enc(enc_x)[0]  # (R, rows, H): state after each row
+
+    def decode(self, h0: torch.Tensor, dec_x: torch.Tensor) -> torch.Tensor:
+        out, _ = self.dec(dec_x, h0.unsqueeze(0).contiguous())
+        return torch.sigmoid(self.head(out))  # (N, steps, 2)
+
+
+def cut_predictions(model: OutcomeGRU, enc_x: torch.Tensor, dec_x: torch.Tensor,
+                    cuts: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Predictions from history rows 0..i for each cut i in ``cuts``, for every later row i+1+j.
+
+    Returns preds (R, C, S, 2), a validity mask (C, S) for rows <= n-1, and idx (C, S): the dec_x / Y[:, 1:]
+    index of the target row (row i+1+j has index i+j).
+    """
+    R, n_dec = enc_x.shape[0], dec_x.shape[1]  # n_dec = n_rows - 1
+    cuts = cuts.to(enc_x.device)
+    h = model.encode(enc_x)[:, cuts]  # (R, C, H)
+    S = n_dec - int(cuts.min())
+    j = torch.arange(S, device=enc_x.device)
+    raw = cuts[:, None] + j[None, :]
+    valid = raw < n_dec
+    idx = raw.clamp(max=n_dec - 1)
+    C = len(cuts)
+    seq = dec_x[:, idx]  # (R, C, S, F)
+    out = model.decode(h.reshape(R * C, -1), seq.reshape(R * C, S, -1)).reshape(R, C, S, 2)
+    return out, valid, idx
+
+
+def fit_gru(tr: Data, va: Data, device: torch.device, epochs: int, hidden: int, seed: int,
+            cuts_per_batch: int = CUTS_PER_BATCH, lr: float = 2e-3, weight_decay: float = 0.0,
+            patience_max: int = 25) -> tuple[OutcomeGRU, list]:
+    """Masked MSE over (cut, future block); early stopping on validation seeds (patience 25 by default).
+
+    lr / weight_decay default to the xp1/xp2 settings (Adam, 2e-3, none); xp3 overfits with them.
+    """
+    torch.manual_seed(seed)
+    model = OutcomeGRU(tr.enc.shape[-1], tr.dec_inputs(tr.W).shape[-1], hidden).to(device)
+    opt = (torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay) if weight_decay
+           else torch.optim.Adam(model.parameters(), lr=lr))
+    tr_dec, va_dec = tr.dec_inputs(tr.W), va.dec_inputs(va.W)
+    n_cuts = tr.n_rows - 1
+    va_cuts = torch.arange(0, n_cuts, max(1, n_cuts // 50))  # fixed, evenly spaced: a stable validation loss
+    best, best_state, history, patience = np.inf, None, [], 0
+    gen = torch.Generator().manual_seed(seed)
+
+    def loss_on(data: Data, dec: torch.Tensor, rows: torch.Tensor, cuts: torch.Tensor) -> torch.Tensor:
+        pred, valid, idx = cut_predictions(model, data.enc[rows].to(device), dec[rows].to(device), cuts)
+        Y = data.Y[rows][:, 1:].to(device)[:, idx]  # (B, C, S, 2): target row i+1+j
+        M = data.Ymask[rows][:, 1:].to(device)[:, idx] * valid[None, :, :, None]
+        return (((pred - Y) ** 2) * M).sum() / M.sum()
+
+    for _ in range(epochs):
+        model.train()
+        for batch in torch.randperm(len(tr.seed), generator=gen).split(32):
+            cuts = (torch.arange(n_cuts) if n_cuts <= cuts_per_batch
+                    else torch.randperm(n_cuts, generator=gen)[:cuts_per_batch].sort().values)
+            opt.zero_grad()
+            loss_on(tr, tr_dec, batch, cuts).backward()
+            opt.step()
+        model.eval()
+        with torch.no_grad():
+            v = np.mean([loss_on(va, va_dec, rows, va_cuts).item() for rows in torch.arange(len(va.seed)).split(16)])
+        history.append(float(v))
+        if v < best - 1e-6:
+            best, patience = v, 0
+            best_state = {k: t.detach().clone() for k, t in model.state_dict().items()}
+        else:
+            patience += 1
+            if patience >= patience_max:
+                break
+    model.load_state_dict(best_state)
+    return model, history
+
+
+@torch.no_grad()
+def predict_cuts(model: OutcomeGRU, data: Data, cuts: torch.Tensor, device, chunk: int = 16) -> np.ndarray:
+    """(R, C, S, 2) predictions under each run's own schedule, computed in chunks of runs."""
+    dec = data.dec_inputs(data.W)
+    parts = [cut_predictions(model, data.enc[r].to(device), dec[r].to(device), cuts)[0].cpu().numpy()
+             for r in torch.arange(len(data.seed)).split(chunk)]
+    return np.concatenate(parts)
+
+
+# ----------------------------------------------------------------------------- baselines
+def ridge_features(data: Data, cut_rows: np.ndarray, target_rows: np.ndarray, run_idx: np.ndarray) -> np.ndarray:
+    """Direct multi-horizon linear baseline: X at the cut, time, horizon, defense, and future-W summaries."""
+    enc = data.enc.numpy()
+    Xc = enc[run_idx, cut_rows]  # (N, F): X, W, t, init, defense one-hot
+    D = data.D.numpy()[run_idx]
+    W = data.W[run_idx]
+    h = (target_rows - cut_rows)[:, None] / data.n_blocks
+    w_target = W[np.arange(len(run_idx)), target_rows][:, None]
+    csum = np.cumsum(W, axis=1)
+    w_frac = ((csum[np.arange(len(run_idx)), target_rows] - csum[np.arange(len(run_idx)), cut_rows])
+              / (target_rows - cut_rows))[:, None]
+    wf = np.concatenate([w_target, w_frac], 1)
+    inter = (wf[:, :, None] * D[:, None, :]).reshape(len(run_idx), -1)  # W summaries x defense
+    return np.concatenate([Xc, h, h**2, wf, inter, wf * h], 1)
+
+
+def pairs(R: int, n_rows: int, cuts: np.ndarray | None = None) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """All (run, cut row, target row) with target > cut, for the given cut rows (default: all)."""
+    cuts = np.arange(n_rows - 1) if cuts is None else np.asarray(cuts)
+    run, cut, tgt = [], [], []
+    for i in cuts:
+        k = np.arange(i + 1, n_rows)
+        run.append(np.repeat(np.arange(R), len(k))); cut.append(np.full(R * len(k), i)); tgt.append(np.tile(k, R))
+    return np.concatenate(run), np.concatenate(cut), np.concatenate(tgt)
+
+
+def fit_ridge(data: Data, alpha: float = 1.0, seed: int = 0) -> list[np.ndarray]:
+    run, cut, tgt = pairs(len(data.seed), data.n_rows)
+    if len(run) > MAX_RIDGE_PAIRS:  # xp2: subsample (xp1's 642k pairs are all used)
+        keep = np.sort(np.random.default_rng(seed).choice(len(run), MAX_RIDGE_PAIRS, replace=False))
+        run, cut, tgt = run[keep], cut[keep], tgt[keep]
+    F = ridge_features(data, cut, tgt, run)
+    F = np.concatenate([F, np.ones((len(F), 1))], 1)
+    Y, M = data.Y.numpy()[run, tgt], data.Ymask.numpy()[run, tgt]
+    coefs = []
+    for c in range(2):
+        keep = M[:, c] > 0
+        A = F[keep]
+        coefs.append(np.linalg.solve(A.T @ A + alpha * np.eye(A.shape[1]), A.T @ Y[keep, c]))
+    return coefs
+
+
+def predict_ridge(coefs: list[np.ndarray], data: Data, run, cut, tgt) -> np.ndarray:
+    F = ridge_features(data, cut, tgt, run)
+    F = np.concatenate([F, np.ones((len(F), 1))], 1)
+    return np.clip(np.stack([F @ c for c in coefs], 1), 0, 1)
+
+
+# ----------------------------------------------------------------------------- check 1
+def eval_cuts(data: Data) -> np.ndarray:
+    n_cuts = data.n_rows - 1
+    return np.arange(0, n_cuts, max(1, n_cuts // 50))  # xp1: every cut; xp2: every 5th
+
+
+def check1(model: OutcomeGRU, ridge: list, train: Data, test: Data, device) -> pd.DataFrame:
+    cuts = eval_cuts(test)
+    pred = predict_cuts(model, test, torch.as_tensor(cuts), device)  # (R, C, S, 2)
+    run, cut, tgt = pairs(len(test.seed), test.n_rows, cuts)
+    pos = np.searchsorted(cuts, cut)
+    gru = pred[run, pos, tgt - cut - 1]
+    lin = predict_ridge(ridge, test, run, cut, tgt)
+    # Defense-mean trajectory (schedule- and history-blind): mean over train runs with the same defense.
+    Ytr, Mtr = train.Y.numpy(), train.Ymask.numpy()
+    mean_traj = {d: np.nansum(Ytr[train.defense == d] * Mtr[train.defense == d], 0)
+                 / Mtr[train.defense == d].sum(0).clip(1) for d in set(train.defense)}
+    dmean = np.stack([mean_traj[test.defense[r]][k] for r, k in zip(run, tgt)])
+    # Oracle persistence: true Y at the cut carried forward (uses unobservable Y; reference only).
+    Y, M = test.Y.numpy(), test.Ymask.numpy()
+    oracle = Y[run, cut]
+    truth, mask = Y[run, tgt], M[run, tgt] * M[run, cut]
+    h = tgt - cut
+    rows = []
+    for c, y in enumerate(Y_COLS):
+        for name, p in [("GRU", gru), ("ridge (direct, W-aware)", lin), ("defense-mean trajectory", dmean),
+                        ("oracle persistence (true Y_b)", oracle)]:
+            for hz in ["all", *horizons(test.n_blocks)]:
+                sel = mask[:, c] > 0
+                if hz != "all":
+                    sel &= h == hz
+                if not sel.any():
+                    continue
+                err = p[sel, c] - truth[sel, c]
+                rows.append({"outcome": y, "model": name, "horizon": hz, "rmse": np.sqrt(np.mean(err**2)),
+                             "mae": np.mean(np.abs(err)), "n": int(sel.sum())})
+    return pd.DataFrame(rows)
+
+
+# ----------------------------------------------------------------------------- check 2 (xp1)
+def implied_effects(model: OutcomeGRU, data: Data, device) -> np.ndarray:
+    """(R, n_blocks, 2): predicted Y at block b with W_b=1 minus W_b=0, from history up to block b-1."""
+    with torch.no_grad():
+        h = model.encode(data.enc.to(device))[:, : data.n_rows - 1]  # history rows 0..i -> predicts row i+1
+        R, C, H = h.shape
+        out = []
+        for w in (1.0, 0.0):
+            Wf = np.full((R, data.n_rows), w)
+            x = data.dec_inputs(Wf).to(device)  # step input for row i+1 is x[:, i]
+            out.append(model.decode(h.reshape(R * C, H), x.reshape(R * C, 1, -1)).reshape(R, C, 2))
+    return (out[0] - out[1]).cpu().numpy()
+
+
+def check2(model: OutcomeGRU, df: pd.DataFrame, test: Data, device, out: Path, n_boot: int) -> pd.DataFrame:
+    eff = implied_effects(model, test, device)
+    rng = np.random.default_rng(0)
+    rows = []
+    for c, y in enumerate(Y_COLS):
+        _, phase, _ = analyze.q1(df, y, n_boot, rng)  # randomized estimate, all 20 seeds
+        for (a, d), g in phase.groupby(["attack", "defense"]):
+            sel = (test.attack == a) & (test.defense == d)
+            gru = eff[sel, :, c].mean(0).reshape(5, -1).mean(1)
+            for _, r in g.iterrows():
+                rows.append({"outcome": y, "attack": a, "defense": d, "phase": r.phase, "randomized": r.effect,
+                             "lo": r.lo, "hi": r.hi, "gru": gru[int(r.phase) - 1]})
+    t = pd.DataFrame(rows)
+    t["inside_ci"] = (t.gru >= t.lo) & (t.gru <= t.hi)
+    fig, axes = plt.subplots(1, 2, figsize=(11, 4.6))
+    for ax, y in zip(axes, Y_COLS):
+        s = t[t.outcome == y]
+        lim = [min(s.lo.min(), s.gru.min()) * 100 - 1, max(s.hi.max(), s.gru.max()) * 100 + 1]
+        ax.plot(lim, lim, color=INK2, linewidth=0.8)
+        for d in DEFENSES:
+            q = s[s.defense == d]
+            ax.errorbar(q.gru * 100, q.randomized * 100, yerr=[(q.randomized - q.lo) * 100, (q.hi - q.randomized) * 100],
+                        fmt="o", markersize=4, color=SERIES[d], elinewidth=0.8, label=d)
+        r = np.corrcoef(s.gru, s.randomized)[0, 1]
+        ax.set_title(f"{analyze.OUTCOMES[y]}: r = {r:.2f}, GRU inside 95% CI in {100 * s.inside_ci.mean():.0f}% "
+                     f"of {len(s)} cells", color=INK, loc="left")
+        ax.set_xlabel("GRU-implied effect, test seeds (pts per defended block)")
+        ax.set_ylabel("randomized estimate, 95% CI (pts)")
+    axes[0].legend(fontsize=8, ncol=2)
+    fig.suptitle("Check 2: one-step effect of W per (attack, defense, phase) — GRU vs randomized estimate",
+                 fontsize=9, color=INK, x=0.01, ha="left")
+    fig.tight_layout()
+    fig.savefig(out / "check2_effects.png", dpi=130)
+    plt.close(fig)
+    return t
+
+
+def is_xp1_shaped(df: pd.DataFrame, data: Data) -> bool:
+    return data.n_blocks == 50 and df.defense.nunique() > 1 and df.attack.nunique() > 1
+
+
+# ----------------------------------------------------------------------------- check K (windowed attacks)
+@torch.no_grad()
+def check_kill(model: OutcomeGRU, data: Data, device, out: Path) -> pd.DataFrame:
+    """For each test run with a windowed attack: history up to the attack's first block (detectable in X), then
+    two plans: defend from the next block on, or never. Predicted backdoor success at the window end and at
+    the run end, next to what the run's own schedule actually produced.
+
+    The window is read from u_active, an evaluation label; it is never a model input.
+    """
+    if data.U is None:
+        return pd.DataFrame()
+    rows = []
+    for r in range(len(data.seed)):
+        if data.attack[r] != "backdoor_win" or data.Ymask[r, :, 1].sum() == 0:
+            continue
+        active = np.flatnonzero(data.U[r] > 0)  # rows (block + 1)
+        if len(active) == 0:
+            continue
+        first, last = int(active[0]), int(active[-1])
+        h = model.encode(data.enc[r:r + 1, : first + 1].to(device))[:, -1]  # state after the first poisoned block
+        preds = {}
+        for name, w in [("defend", 1.0), ("never", 0.0)]:
+            W = data.W[r:r + 1].copy()
+            W[:, first + 1:] = w
+            dec = data.dec_inputs(W, runs=slice(r, r + 1))[:, first:]  # rows first+1 .. n-1
+            preds[name] = model.decode(h.expand(1, -1), dec.to(device))[0, :, 1].cpu().numpy()
+        end_w = last - first - 1  # index of the window's last row in the decoded sequence
+        W_true = data.W[r]
+        on_rows = np.flatnonzero(W_true[first:] > 0)
+        delay = int(on_rows[0]) if len(on_rows) else -1  # blocks after the attack's first block
+        covered = len(on_rows) > 0 and bool((W_true[first + delay: last + 1] > 0).all())
+        rows.append({
+            "run_id": data.run_ids[r], "seed": int(data.seed[r]), "window_blocks": (first - 1, last - 1),
+            "actual_delay_blocks": delay, "actual_covered_to_end": covered,
+            "actual_atk_window_end": float(data.Y[r, last, 1]), "actual_atk_final": float(data.Y[r, -1, 1]),
+            "gru_atk_window_end_if_defend": float(preds["defend"][max(end_w, 0)]),
+            "gru_atk_window_end_if_never": float(preds["never"][max(end_w, 0)]),
+            "gru_atk_final_if_defend": float(preds["defend"][-1]), "gru_atk_final_if_never": float(preds["never"][-1]),
+        })
+    t = pd.DataFrame(rows)
+    if len(t):
+        t.to_csv(out / "checkK_kill.csv", index=False)
+    return t
+
+
+# ----------------------------------------------------------------------------- check 3 (xp1)
+def score_cf(model: OutcomeGRU, ridge: list, train: Data, cf_df: pd.DataFrame, xp1: pd.DataFrame,
+             device, out: Path) -> dict:
+    """Score predictions on true counterfactual runs. History = the run's own first CF_PREFIX blocks (observed)."""
+    res: dict = {}
+    # Reproduction check: cf 'random' runs must equal the xp1 runs with the same run_id.
+    rand = cf_df[~cf_df.run_id.str.contains("__cf_")]
+    if len(rand):
+        merged = rand.merge(xp1, on=["run_id", "block"], suffixes=("", "_xp1"))
+        cols = [c for c in [*X_COLS, *Y_COLS] if c in rand.columns]
+        diffs = {c: float(np.nanmax(np.abs(merged[c] - merged[f"{c}_xp1"]))) for c in cols}
+        res["reproduction"] = {"runs": int(rand.run_id.nunique()), "max_abs_diff": max(diffs.values()),
+                               "per_column": diffs}
+    data = Data(cf_df[cf_df.run_id.str.contains("__cf_")], train.x_mean, train.x_std)
+    n = data.n_rows
+    sched = pd.Series(data.run_ids).str.extract(r"__cf_(\w+?)_p\d+__")[0].to_numpy()
+    cut = CF_PREFIX  # rows 0..3 = blocks -1..2 observed
+    with torch.no_grad():
+        h = model.encode(data.enc[:, : cut + 1].to(device))[:, -1]
+        pred = model.decode(h, data.dec_inputs(data.W)[:, cut:].to(device)).cpu().numpy()  # rows cut+1..n-1
+    run, tgt = np.repeat(np.arange(len(data.seed)), n - 1 - cut), np.tile(np.arange(cut + 1, n), len(data.seed))
+    lin = predict_ridge(ridge, data, run, np.full(len(run), cut), tgt).reshape(len(data.seed), -1, 2)
+    Y, M = data.Y.numpy()[:, cut + 1:], data.Ymask.numpy()[:, cut + 1:]
+    rows = []
+    for r in range(len(data.seed)):
+        for c, y in enumerate(Y_COLS):
+            if M[r, -1, c] == 0:
+                continue
+            rows.append({"run_id": data.run_ids[r], "attack": data.attack[r], "defense": data.defense[r],
+                         "seed": data.seed[r], "schedule": sched[r], "outcome": y,
+                         "true_final": Y[r, -1, c], "gru_final": pred[r, -1, c], "ridge_final": lin[r, -1, c],
+                         "gru_rmse_traj": float(np.sqrt(np.mean((pred[r, :, c] - Y[r, :, c]) ** 2))),
+                         "ridge_rmse_traj": float(np.sqrt(np.mean((lin[r, :, c] - Y[r, :, c]) ** 2)))})
+    t = pd.DataFrame(rows)
+    t.to_csv(out / "check3_counterfactual.csv", index=False)
+    # Ranking: per (seed, attack, defense, outcome), do predicted finals order the 5 schedules like the truth?
+    rank = []
+    for key, g in t.groupby(["seed", "attack", "defense", "outcome"]):
+        if g.true_final.nunique() > 1:
+            rank.append({"outcome": key[3], "attack": key[1], "defense": key[2],
+                         "gru_spearman": g.true_final.rank().corr(g.gru_final.rank()),
+                         "ridge_spearman": g.true_final.rank().corr(g.ridge_final.rank())})
+    res["ranking"] = pd.DataFrame(rank).groupby(["outcome", "attack"])[["gru_spearman", "ridge_spearman"]].mean() \
+        .round(3).reset_index().to_dict("records") if rank else []
+    res["final_error"] = t.groupby(["outcome", "schedule"]).apply(
+        lambda g: pd.Series({"true": g.true_final.mean(), "gru": g.gru_final.mean(), "ridge": g.ridge_final.mean(),
+                             "gru_mae": (g.gru_final - g.true_final).abs().mean(),
+                             "ridge_mae": (g.ridge_final - g.true_final).abs().mean()})).round(3) \
+        .reset_index().to_dict("records")
+    return res
+
+
+# ----------------------------------------------------------------------------- support diagnostic
+def support(df: pd.DataFrame) -> dict:
+    """How long the defended stretches in the training schedules are (the GRU's training support)."""
+    W = df[df.block >= 0].sort_values(["run_id", "block"]).groupby("run_id").W.apply(lambda s: [int(v) for v in s])
+    n_blocks = len(W.iloc[0])
+    longest_on = W.apply(lambda w: max(len(m) for m in re.findall("1+", "".join(map(str, w))) or [""]))
+    first_off = W.apply(lambda w: w.index(0) if 0 in w else len(w))
+    return {"runs": int(len(W)), "n_blocks": n_blocks, "longest_defended_streak_max": int(longest_on.max()),
+            "longest_defended_streak_median": float(longest_on.median()),
+            "first_undefended_block_median": float(first_off.median()),
+            "runs_with_defended_streak_over_20pct": int((longest_on >= n_blocks // 5).sum())}
+
+
+# ----------------------------------------------------------------------------- main
+def main() -> None:
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--runs", type=Path, default=Path("results/xp1/results_collect/runs/all_blocks.csv"))
+    ap.add_argument("--out", type=Path, default=Path("results/xp1/gru"))
+    ap.add_argument("--cf", type=Path, help="all_blocks.csv of the counterfactual runs (check 3)")
+    ap.add_argument("--retrain", action="store_true", help="overwrite the frozen gru.pt (never with --cf)")
+    ap.add_argument("--epochs", type=int, default=300)
+    ap.add_argument("--hidden", type=int, default=64)
+    ap.add_argument("--cuts-per-batch", type=int, default=CUTS_PER_BATCH)
+    ap.add_argument("--seed", type=int, default=0)
+    ap.add_argument("--boot", type=int, default=500)
+    ap.add_argument("--lr", type=float, default=2e-3)
+    ap.add_argument("--wd", type=float, default=0.0, help="AdamW weight decay (0 = Adam, as in xp1/xp2)")
+    ap.add_argument("--patience", type=int, default=25)
+    args = ap.parse_args()
+    if args.cf and args.retrain:
+        raise SystemExit("--retrain with --cf would score check 3 with a model fitted after the runs existed.")
+    sys.stdout.reconfigure(encoding="utf-8")
+    args.out.mkdir(parents=True, exist_ok=True)
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    df = analyze.load(args.runs)
+    split = assign_splits(df)
+    train = Data(df[split == "train"])
+    val = Data(df[split == "val"], train.x_mean, train.x_std)
+    test = Data(df[split == "test"], train.x_mean, train.x_std)
+    print(f"runs: train {len(train.seed)}, val {len(val.seed)}, test {len(test.seed)}; "
+          f"{train.n_blocks} blocks per run; device {device}", flush=True)
+
+    weights = args.out / "gru.pt"
+    model = OutcomeGRU(train.enc.shape[-1], train.dec_inputs(train.W).shape[-1], args.hidden).to(device)
+    if weights.exists() and not args.retrain:
+        # Frozen model (check 3 must use the model trained BEFORE the counterfactual runs existed).
+        model.load_state_dict(torch.load(weights, map_location=device))
+        model.eval()
+        history = json.loads((args.out / "report.json").read_text())["val_history"]
+    elif args.cf:
+        raise SystemExit(f"No frozen model at {weights}: train it first (without --cf).")
+    else:
+        model, history = fit_gru(train, val, device, args.epochs, args.hidden, args.seed, args.cuts_per_batch,
+                                 args.lr, args.wd, args.patience)
+        model.eval()
+        torch.save(model.state_dict(), weights)
+    weights_sha = hashlib.sha256(weights.read_bytes()).hexdigest()[:16]
+    print(f"model: {len(history)} epochs, best val MSE {min(history):.5f}, weights sha256 {weights_sha}", flush=True)
+    ridge = fit_ridge(train)
+
+    c1 = check1(model, ridge, train, test, device)
+    c1.to_csv(args.out / "check1_prediction.csv", index=False)
+    report = {"weights_sha256": weights_sha, "n_blocks": train.n_blocks, "support": support(df),
+              "hparams": {"hidden": args.hidden, "lr": args.lr, "wd": args.wd, "patience": args.patience,
+                          "cuts_per_batch": args.cuts_per_batch, "seed": args.seed},
+              "epochs": len(history), "best_val_mse": min(history), "val_history": history}
+    c2 = check2(model, df, test, device, args.out, args.boot) if is_xp1_shaped(df, test) else None
+    if c2 is not None:
+        c2.to_csv(args.out / "check2_effects.csv", index=False)
+    ck = check_kill(model, test, device, args.out)
+    if args.cf:
+        report["check3"] = score_cf(model, ridge, train, analyze.load(args.cf), df, device, args.out)
+    (args.out / ("report_cf.json" if args.cf else "report.json")).write_text(json.dumps(report, indent=2, default=float))
+
+    print("\n## Check 1: test-seed prediction error (RMSE, accuracy units)")
+    print(c1.pivot_table(index=["outcome", "model"], columns="horizon", values="rmse", sort=False).round(4).to_string())
+    if c2 is not None:
+        print("\n## Check 2: GRU-implied one-step effect vs randomized estimate")
+        for y, s in c2.groupby("outcome"):
+            print(f"{y}: corr {np.corrcoef(s.gru, s.randomized)[0, 1]:.3f}, inside 95% CI "
+                  f"{100 * s.inside_ci.mean():.0f}% of {len(s)} cells")
+    if len(ck):
+        killed = (ck.actual_atk_window_end < 0.1)
+        print(f"\n## Check K: kill awareness on {len(ck)} windowed test runs")
+        print(f"predicted backdoor at window end if defending from the attack's 2nd block: "
+              f"mean {ck.gru_atk_window_end_if_defend.mean():.3f}; if never defending: "
+              f"mean {ck.gru_atk_window_end_if_never.mean():.3f}")
+        print(f"actual: {int(killed.sum())} runs killed (backdoor < 0.1 at window end), {int((~killed).sum())} not")
+    print("\n## Training support")
+    print(json.dumps(report["support"], indent=2))
+    if "check3" in report:
+        print("\n## Check 3")
+        print(json.dumps(report["check3"], indent=2, default=float))
+
+
+if __name__ == "__main__":
+    main()
+__KRUM_TESTBED_EOF__
+cat > check_probe.py <<'__KRUM_TESTBED_EOF__'
+"""Check P (probe decisions): does the GRU tell 'hold the defense' from 'keep probing' after a defended block?
+
+    python check_probe.py results/xp3/gru_sweep/a results/xp3/gru_sweep/b ...   # score each model (val + test)
+    python check_probe.py --select results/xp3/gru_sweep/*                     # pick the best on validation
+
+For every xp3 run of a split and every block b whose previous block was defended (a probe or a hold), the
+controller of deploy_xp3 compares two plans for blocks b..b+H-1: keep probing (one defended block every P) or
+defend every block. Gain = score(defend) - score(probe), score = clean - LAMBDA * backdoor at block b+H-1.
+Label (evaluation only, from u_active): the attack is active in block b-1. A good model has gain > 0 when an
+attack is active and gain < 0 when none is: reported as AUC, and as TPR / FPR of the rule gain > 0.
+
+--select scores every model on validation seeds only, picks the highest AUC (ties: lower FPR), then scores the
+chosen one on test seeds, and writes results/xp3/gru_selected.json. Test seeds never influence the choice.
+"""
+
+import argparse
+import json
+import sys
+from pathlib import Path
+
+import numpy as np
+import pandas as pd
+import torch
+from sklearn.metrics import roc_auc_score
+
+import analyze
+from deploy_xp3 import HORIZON, LAMBDA, PROBE_PERIOD
+from gru_experiment import Data, OutcomeGRU, assign_splits
+
+RUNS = Path("results/xp3/runs_xp3/all_blocks.csv")
+SELECTED = Path("results/xp3/gru_selected.json")
+
+
+@torch.no_grad()
+def gains(model: OutcomeGRU, data: Data, device) -> pd.DataFrame:
+    """One decoder call per run: every eligible cut x both plans (cuts with a full horizon left)."""
+    rows, H, nb = [], HORIZON, data.n_blocks
+    h_all = model.encode(data.enc.to(device))  # (R, rows, hidden): h_all[r, b] = state after blocks -1..b-1
+    for r in range(len(data.seed)):
+        cuts = np.array([b for b in range(1, nb - H + 1) if data.W[r, b] == 1])  # block b-1 defended
+        if not len(cuts):
+            continue
+        W = np.zeros((2 * len(cuts), data.n_rows))
+        for k, b in enumerate(cuts):
+            W[2 * k, b + 1: b + 1 + H] = [int(j % PROBE_PERIOD == 0) for j in range(b, b + H)]  # keep probing
+            W[2 * k + 1, b + 1: b + 1 + H] = 1                                                # defend
+        dec = data.dec_inputs(W, runs=slice(r, r + 1))  # (2C, n_rows-1, F); index i = row i+1 = block i
+        idx = np.repeat(cuts, 2)[:, None] + np.arange(H)[None, :]  # blocks b..b+H-1
+        seq = dec[np.arange(len(W))[:, None], idx].to(device)
+        h0 = h_all[r, torch.as_tensor(np.repeat(cuts, 2), device=device)]
+        p = model.decode(h0, seq)[:, -1].cpu().numpy().reshape(len(cuts), 2, 2)  # (cut, plan, outcome)
+        s = p[..., 0] - LAMBDA * p[..., 1]
+        rows.append(pd.DataFrame({"run": data.run_ids[r], "attack": data.attack[r], "block": cuts,
+                                  "gain": s[:, 1] - s[:, 0], "active": data.U[r, cuts] > 0,
+                                  "atk_probe": p[:, 0, 1], "atk_defend": p[:, 1, 1]}))
+    return pd.concat(rows, ignore_index=True)
+
+
+def score(t: pd.DataFrame) -> dict:
+    y, g = t.active.to_numpy(bool), t.gain.to_numpy()
+    return {"cuts": len(t), "active": int(y.sum()), "auc": round(float(roc_auc_score(y, g)), 3),
+            "tpr": round(float((g[y] > 0).mean()), 3), "fpr": round(float((g[~y] > 0).mean()), 3),
+            "fpr_no_attack_runs": round(float((t[t.attack == "none"].gain > 0).mean()), 3)}
+
+
+def load_model(folder: Path, train: Data, device) -> tuple[OutcomeGRU, dict]:
+    rep = json.loads((folder / "report.json").read_text())
+    hidden = (rep.get("hparams") or {}).get("hidden", 64)
+    model = OutcomeGRU(train.enc.shape[-1], train.dec_inputs(train.W).shape[-1], hidden).to(device)
+    model.load_state_dict(torch.load(folder / "gru.pt", map_location=device))
+    model.eval()
+    return model, {"hparams": rep.get("hparams"), "epochs": rep["epochs"], "best_val_mse": round(rep["best_val_mse"], 5),
+                   "weights_sha256": rep["weights_sha256"]}
+
+
+def main() -> None:
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("models", nargs="+", type=Path)
+    ap.add_argument("--select", action="store_true")
+    args = ap.parse_args()
+    sys.stdout.reconfigure(encoding="utf-8")
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    df = analyze.load(RUNS)
+    split = assign_splits(df)
+    train = Data(df[split == "train"])
+    sets = {name: Data(df[split == name], train.x_mean, train.x_std) for name in ("val", "test")}
+    models = [m for m in args.models if (m / "gru.pt").exists() and (m / "report.json").exists()]
+    out = {}
+    for folder in models:
+        model, res = load_model(folder, train, device)
+        for name in ("val",) if args.select else ("val", "test"):
+            t = gains(model, sets[name], device)
+            t.to_csv(folder / f"checkP_{name}.csv", index=False)
+            res[name] = score(t)
+        out[str(folder)] = res
+        print(folder, json.dumps(res), flush=True)
+    if args.select:
+        best = max(out, key=lambda k: (out[k]["val"]["auc"], -out[k]["val"]["fpr"]))
+        model, _ = load_model(Path(best), train, device)
+        t = gains(model, sets["test"], device)
+        t.to_csv(Path(best) / "checkP_test.csv", index=False)
+        out[best]["test"] = score(t)
+        verdict = "ok" if out[best]["val"]["auc"] >= 0.7 else "WEAK: validation AUC < 0.7, deployment is unlikely to help"
+        SELECTED.write_text(json.dumps({"selected": best, "verdict": verdict, "models": out}, indent=2))
+        print(f"\nselected {best}: val {out[best]['val']}, test {out[best]['test']} -> {verdict}", flush=True)
+    else:
+        Path("results/xp3/checkP_models.json").write_text(json.dumps(out, indent=2))
+
+
+if __name__ == "__main__":
+    main()
+__KRUM_TESTBED_EOF__
+cat > deploy_xp3.py <<'__KRUM_TESTBED_EOF__'
+"""Deploy the xp3 GRU as a probing defense controller, against the fixed evaluation protocol.
+
+    python deploy_xp3.py --gru results/xp3/gru      # all policies x all environments -> results/deploy_xp3
+    python deploy_xp3.py --report-only
+
+Environments (seeds never seen in training: xp3 used 10000-10319). Every attack is the xp3 windowed backdoor with
+Krum as the defense, decisions every 2 rounds (250 blocks):
+    pf1/8, pf2/8, pf8/8   1, 2 or 8 of the 8 images in each poisoned micro-batch are patched (f = 3 of 16)
+    none                  no attack (false alarms)
+4 seeds per condition: 2 with an early window (start in blocks 2-20), 2 with a late one (21-150); length 30-80.
+
+Policies (same seed = same data, same noise, same attack):
+    off / on              never / always defend
+    oracle                defends exactly the attack window (knows the attack; reference only)
+    threshold_defender    defend when x_norm_std of the previous block > TAU; hold until K low blocks
+    probe_threshold       threshold defender + a probe (one defended block) every P blocks
+    gru                   probe every P blocks by default; before each block, the GRU predicts the outcomes at
+                          block b+H-1 under two plans for the next H blocks: "keep probing" or "defend", and
+                          applies the first action of the better plan (score = clean - LAMBDA * backdoor).
+
+Why probes: a stealthy backdoor (1/8, 2/8) is invisible in X while undefended and obvious while defended, and Krum
+still erases it if switched on within ~10 blocks (2/8) or ~20 blocks (1/8) (measure_erasure.py). A one-block probe
+every P = 5 blocks looks often enough, at ~20% defended blocks.
+"""
+
+import argparse
+import hashlib
+import json
+import sys
+import time
+from concurrent.futures import ProcessPoolExecutor, as_completed
+from multiprocessing import get_context
+from pathlib import Path
+
+import matplotlib
+
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt  # noqa: E402
+import numpy as np  # noqa: E402
+import pandas as pd  # noqa: E402
+import torch  # noqa: E402
+from matplotlib.lines import Line2D  # noqa: E402
+from matplotlib.patches import Patch  # noqa: E402
+
+import poison_testbed  # noqa: E402,F401  (CUBLAS_WORKSPACE_CONFIG)
+from analyze import INK, INK2, SURFACE, X_COLS  # noqa: E402  (also applies the shared plot style)
+from gru_experiment import Data, OutcomeGRU, assign_splits  # noqa: E402
+from poison_testbed.runner import RunConfig, simulate  # noqa: E402
+
+ROOT = Path(__file__).resolve().parent
+TRAIN_RUNS = ROOT / "results/xp3/runs_xp3/all_blocks.csv"
+OUT = ROOT / "results/deploy_xp3"
+
+XP1_C, SIGMA, BLOCK_LEN, N_BLOCKS = 3.0552712798118593, 0.01, 2, 250
+N_ROWS = N_BLOCKS + 1
+DEFENSE = "Krum"
+CONDITIONS = {"pf1/8": ("backdoor_win", 0.125), "pf2/8": ("backdoor_win", 0.25), "pf8/8": ("backdoor_win", 1.0),
+              "none": ("none", 1.0)}
+SEEDS_PER_CONDITION = 4  # k = 0, 1: early window; k = 2, 3: late window
+POLICIES = ["off", "on", "oracle", "threshold_defender", "probe_threshold", "gru"]
+
+SIGNAL, TAU, K_HOLD = "x_norm_std", 3.65, 12  # threshold defender, as in pilot_xp3 (TAU fitted on xp2 train runs)
+PROBE_PERIOD = 5  # blocks between probes (one defended block each)
+HORIZON = 20      # blocks (40 rounds): longer than the slowest erasure window (~20 rounds at 1/8)
+LAMBDA = 1.0
+
+POLICY_COLOR = {"off": "#1baf7a", "on": "#eb6834", "oracle": "#e87ba4", "threshold_defender": "#eda100",
+                "probe_threshold": "#008300", "gru": "#2a78d6"}
+POLICY_LABEL = {"off": "always off", "on": "always on", "oracle": "oracle (defends exactly the attack)",
+                "threshold_defender": "threshold defender", "probe_threshold": f"threshold defender + probe every {PROBE_PERIOD}",
+                "gru": "GRU (probes + decides when to hold)"}
+DRAW_ORDER = ["off", "on", "oracle", "threshold_defender", "probe_threshold", "gru"]
+
+
+def environment(cond: str, k: int) -> tuple[int, tuple[int, int]]:
+    """Seed and attack window (blocks, inclusive) of environment k of a condition. No-attack runs get a
+    window too (it is never used by the attack; it only defines the 'false alarm' blocks as all blocks)."""
+    seed = 5000 + 100 * list(CONDITIONS).index(cond) + k
+    rng = np.random.default_rng(60_000 + seed)
+    start = int(rng.integers(2, 21)) if k < SEEDS_PER_CONDITION // 2 else int(rng.integers(21, 151))
+    return seed, (start, start + int(rng.integers(30, 81)) - 1)
+
+
+def is_probe(b: int) -> bool:
+    return b % PROBE_PERIOD == 0
+
+
+# ----------------------------------------------------------------------------- controllers
+class ThresholdDefender:
+    """Defend when the previous block's signal exceeds TAU; stay on until it has been low for K_HOLD blocks.
+    With probe=True, also defend one block every PROBE_PERIOD blocks (so stealthy attacks become visible)."""
+
+    def __init__(self, probe: bool = False):
+        self.probe, self.on, self.low = probe, False, 0
+
+    def __call__(self, history: list[dict], b: int) -> tuple[int, dict]:
+        value = history[-1].get(SIGNAL)
+        value = float("nan") if value is None else float(value)
+        if value > TAU:
+            self.on, self.low = True, 0
+        elif self.on:
+            self.low += 1
+            if self.low >= K_HOLD:
+                self.on, self.low = False, 0
+        probe = self.probe and is_probe(b) and not self.on
+        return int(self.on or probe), {"det_signal": value, "det_hold": int(self.on), "probe": int(probe)}
+
+
+class GRUProbeController:
+    """Default: keep probing. Before each block, compare 'keep probing' with 'defend' over the next H blocks."""
+
+    def __init__(self, weights: Path, x_mean: np.ndarray, x_std: np.ndarray, device: str, horizon: int = HORIZON):
+        self.x_mean, self.x_std, self.device, self.horizon = x_mean, x_std, torch.device(device), horizon
+        probe = self._data([{"run_id": "p", "seed": 0, "defense": DEFENSE, "block": -1, "W": np.nan}])
+        hidden = json.loads((weights.parent / "report.json").read_text()).get("hparams", {}).get("hidden", 64)
+        self.model = OutcomeGRU(probe.enc.shape[-1], probe.dec_inputs(probe.W).shape[-1], hidden).to(self.device)
+        self.model.load_state_dict(torch.load(weights, map_location=self.device))
+        self.model.eval()
+
+    def _data(self, history: list[dict]) -> Data:
+        """Pad the history to N_ROWS rows (the encoder is causal: padding never affects the state we read)."""
+        df = pd.DataFrame(history)
+        last = int(df.block.max())
+        pad = pd.DataFrame([{"run_id": df.run_id.iloc[0], "seed": df.seed.iloc[0], "defense": df.defense.iloc[0],
+                             "block": b} for b in range(last + 1, N_BLOCKS)])
+        df = pd.concat([df, pad], ignore_index=True)
+        df["attack"] = "unknown"  # the controller never knows the attack
+        for c in ["W", "y_clean_acc", "y_atk", *X_COLS]:  # outcomes are never in the history: all NaN
+            if c not in df:
+                df[c] = np.nan
+        df["W"] = pd.to_numeric(df.W, errors="coerce")
+        return Data(df, self.x_mean, self.x_std)
+
+    @torch.no_grad()
+    def __call__(self, history: list[dict], b: int) -> tuple[int, dict]:
+        data = self._data(history)
+        h = self.model.encode(data.enc.to(self.device))[:, b]  # state after rows 0..b = blocks -1..b-1
+        H = min(self.horizon, N_BLOCKS - b)
+        plans = {"probe": [int(is_probe(k)) for k in range(b, b + H)], "defend": [1] * H}
+        W = np.zeros((2, N_ROWS))
+        for k, p in enumerate(plans.values()):
+            W[k, b + 1: b + 1 + H] = p  # row i = block i-1
+        dec = data.dec_inputs(W)[:, b: b + H]
+        pred = self.model.decode(h.expand(2, -1), dec.to(self.device)).cpu().numpy()[:, -1]  # (2, 2) at b+H-1
+        score = pred[:, 0] - LAMBDA * pred[:, 1]
+        choice = "defend" if score[1] > score[0] else "probe"
+        return plans[choice][0], {
+            "gru_choice": choice, "probe": int(choice == "probe" and plans["probe"][0] == 1),
+            "gru_pred_clean_probe": float(pred[0, 0]), "gru_pred_atk_probe": float(pred[0, 1]),
+            "gru_pred_clean_defend": float(pred[1, 0]), "gru_pred_atk_defend": float(pred[1, 1]),
+            "gru_gain_defend": float(score[1] - score[0])}
+
+
+# ----------------------------------------------------------------------------- runs
+def config(cond: str, policy: str, k: int) -> RunConfig:
+    attack, pf = CONDITIONS[cond]
+    seed, window = environment(cond, k)
+    if policy == "oracle":
+        schedule = "react_d0_e0" if attack != "none" else "off"  # no attack: the oracle never defends
+    else:
+        schedule = policy if policy in ("on", "off") else "policy"
+    return RunConfig(attack=attack, defense=DEFENSE, seed=seed, C=XP1_C, sigma=SIGMA, schedule=schedule,
+                     block_len=BLOCK_LEN, n_blocks=N_BLOCKS, window=window, poison_frac=pf,
+                     always_measure_backdoor=True)
+
+
+def run_id_of(cond: str, policy: str, k: int) -> str:
+    return f"{cond.replace('/', 'of')}__{policy}__s{environment(cond, k)[0]}"
+
+
+def run_one(cond: str, policy: str, k: int, weights: str, x_mean: np.ndarray, x_std: np.ndarray,
+            out_root: str) -> tuple[str, float]:
+    cfg = config(cond, policy, k)
+    run_id = run_id_of(cond, policy, k)
+    out = Path(out_root) / "runs" / run_id
+    if (out / "blocks.csv").exists():
+        return run_id, json.loads((out / "config.json").read_text())["wall_clock_s"]
+    controller = {"threshold_defender": lambda: ThresholdDefender(False),
+                  "probe_threshold": lambda: ThresholdDefender(True),
+                  "gru": lambda: GRUProbeController(Path(weights), x_mean, x_std, cfg.device)}.get(policy, lambda: None)()
+    started = time.time()
+    df = simulate(cfg, controller)
+    wall = time.time() - started
+    df.insert(0, "condition", cond)
+    df.insert(1, "policy", policy)
+    df["run_id"] = run_id
+    df["window_start"], df["window_end"] = cfg.window  # evaluation labels (never seen by a controller)
+    out.mkdir(parents=True, exist_ok=True)
+    df.to_csv(out / "blocks.csv", index=False)
+    (out / "config.json").write_text(json.dumps({
+        "run_id": run_id, "condition": cond, "policy": policy, "config": cfg.__dict__,
+        "gru_weights": weights if policy == "gru" else None,
+        "gru_weights_sha256": hashlib.sha256(Path(weights).read_bytes()).hexdigest()[:16] if policy == "gru" else None,
+        "lambda": LAMBDA, "horizon_blocks": HORIZON, "probe_period": PROBE_PERIOD, "tau": TAU, "k_hold": K_HOLD,
+        "wall_clock_s": round(wall, 1),
+        "device_name": torch.cuda.get_device_name(0) if cfg.device == "cuda" else cfg.device,
+    }, indent=2, default=str))
+    return run_id, wall
+
+
+# ----------------------------------------------------------------------------- report
+def summarize(blocks: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
+    rows = []
+    for run_id, g in blocks.groupby("run_id"):
+        tr = g[g.block >= 0].sort_values("block")
+        w = tr.W.astype(int).to_numpy()
+        attacked = tr.condition.iloc[0] != "none"
+        active = tr.u_active.to_numpy().astype(bool)
+        s = int(tr.window_start.iloc[0])
+        sustained = np.flatnonzero(w[s:-1] & w[s + 1:]) if attacked else []  # two defended blocks in a row
+        rows.append({
+            "condition": tr.condition.iloc[0], "policy": tr.policy.iloc[0], "seed": int(tr.seed.iloc[0]),
+            "early_window": s <= 20, "window_start": s, "window_end": int(tr.window_end.iloc[0]),
+            # standard metrics first
+            "final_clean_acc": tr.y_clean_acc.iloc[-1], "final_backdoor_success": tr.y_atk.iloc[-1],
+            "attack_killed": bool(tr.y_atk.iloc[-1] < 0.1) if attacked else np.nan,
+            "peak_backdoor_success": tr.y_atk.max(),
+            # defense usage
+            "defended_blocks": int(w.sum()), "defended_in_window": int(w[active].sum()) if attacked else 0,
+            "false_alarm_blocks": int(w[~active].sum()),  # defended while no attack is active (incl. probes)
+            "probe_blocks": int(tr.probe.sum()) if "probe" in tr else 0,
+            "hold_delay_blocks": int(sustained[0]) if len(sustained) else np.nan,
+        })
+    per_run = pd.DataFrame(rows)
+    on = per_run[per_run.policy == "on"].set_index("seed").final_clean_acc
+    per_run["clean_vs_on_pts"] = 100 * (per_run.final_clean_acc - per_run.seed.map(on))
+    per_run["score_true"] = per_run.final_clean_acc - LAMBDA * per_run.final_backdoor_success  # complementary
+    per_run = per_run.sort_values(["condition", "policy", "seed"])
+    metrics = ["final_clean_acc", "final_backdoor_success", "attack_killed", "clean_vs_on_pts", "defended_blocks",
+               "false_alarm_blocks", "probe_blocks", "hold_delay_blocks", "score_true"]
+    agg = per_run.groupby(["condition", "policy"])[metrics].mean().round(4).reset_index()
+    agg["policy"] = pd.Categorical(agg.policy, POLICIES)
+    return per_run, agg.sort_values(["condition", "policy"])
+
+
+def fig_condition(blocks: pd.DataFrame, cond: str, out: Path) -> None:
+    """Rows: backdoor success, clean accuracy, decisions per controller. Columns: the condition's seeds."""
+    g = blocks[(blocks.condition == cond) & (blocks.block >= 0)]
+    seeds = sorted(g.seed.unique())
+    present = [p for p in DRAW_ORDER if p in set(g.policy)]
+    deciders = [p for p in ["gru", "probe_threshold", "threshold_defender", "oracle"] if p in present]
+    fig, axes = plt.subplots(3, len(seeds), figsize=(3.6 * len(seeds), 8.4), sharex=True, squeeze=False,
+                             gridspec_kw={"height_ratios": [1, 1, 0.55]})
+    for j, seed in enumerate(seeds):
+        s = g[g.seed == seed]
+        ref = s[s.policy == present[0]].sort_values("block")
+        ws, we = int(ref.window_start.iloc[0]), int(ref.window_end.iloc[0])
+        gw = s[s.policy == "gru"].sort_values("block").W.astype(int).to_numpy() if "gru" in present else []
+        for i, (col, label) in enumerate([("y_atk", "backdoor success"), ("y_clean_acc", "clean accuracy")]):
+            ax = axes[i, j]
+            if cond != "none":
+                ax.axvspan(ws - 0.5, we + 0.5, color=INK2, alpha=0.08, linewidth=0)
+            for b in np.flatnonzero(gw):
+                ax.axvspan(b - 0.5, b + 0.5, ymin=0, ymax=0.035, color=POLICY_COLOR["gru"], linewidth=0)
+            for p in present:
+                q = s[s.policy == p].sort_values("block")
+                ax.plot(q.block, q[col], color=POLICY_COLOR[p], linewidth=2.0 if p == "gru" else 1.2,
+                        zorder=3 if p == "gru" else 2)
+            if col == "y_atk":
+                ax.set_ylim(-0.03, 1.03)
+                gru_run = s[s.policy == "gru"]
+                ttl = f"seed {seed}: " + (f"attack in blocks {ws}-{we}" if cond != "none" else "no attack")
+                if len(gru_run):
+                    ttl += f"\nGRU defended {int(gru_run[gru_run.block >= 0].W.sum())} / {N_BLOCKS} blocks"
+                ax.set_title(ttl, color=INK)
+            else:
+                ax.set_ylim(max(0.0, g[g.block >= 10][col].min() - 0.02), min(1.0, g[col].max() + 0.01))
+            if j == 0:
+                ax.set_ylabel(label)
+        ax = axes[2, j]  # decision raster: one line per controller
+        if cond != "none":
+            ax.axvspan(ws - 0.5, we + 0.5, color=INK2, alpha=0.08, linewidth=0)
+        for r, p in enumerate(deciders):
+            q = s[s.policy == p].sort_values("block")
+            on = q.block[q.W.astype(int) == 1].to_numpy()
+            ax.broken_barh([(b - 0.5, 1) for b in on], (r - 0.35, 0.7), color=POLICY_COLOR[p], linewidth=0)
+        ax.set_yticks(range(len(deciders)), [POLICY_LABEL[p].split(" (")[0] for p in deciders] if j == 0 else [])
+        ax.set_ylim(-0.6, len(deciders) - 0.4)
+        ax.invert_yaxis()
+        ax.set_xlabel("block (2 SGD steps each)")
+        ax.grid(False)
+    axes[2, 0].set_ylabel("defended blocks")
+    handles = [Line2D([], [], color=POLICY_COLOR[p], linewidth=2.0 if p == "gru" else 1.3, label=POLICY_LABEL[p])
+               for p in present]
+    if cond != "none":
+        handles.append(Patch(color=INK2, alpha=0.15, label="attack active"))
+    desc = {"pf1/8": "1 of 8 images poisoned", "pf2/8": "2 of 8 images poisoned", "pf8/8": "8 of 8 images poisoned",
+            "none": "no attack"}[cond]
+    fig.suptitle(f"Deployment, windowed backdoor + Krum, {desc}: trajectories and defense decisions "
+                 f"(same seed = same data and noise)", fontsize=10, color=INK, x=0.01, y=0.995, ha="left")
+    top = 1 - 0.75 / fig.get_figheight()
+    fig.legend(handles=handles, loc="upper left", bbox_to_anchor=(0.01, top + 0.04), ncol=4, fontsize=8)
+    fig.tight_layout(rect=(0, 0, 1, top - 0.03))
+    fig.savefig(out / f"trajectory_{cond.replace('/', 'of')}.png", dpi=130)
+    plt.close(fig)
+
+
+def fig_summary(per_run: pd.DataFrame, out: Path) -> None:
+    """Per condition: final backdoor success, clean accuracy vs always-on, defended blocks; one dot per seed."""
+    panels = [("final_backdoor_success", "final backdoor success"), ("clean_vs_on_pts", "final clean acc. − always-on (pts)"),
+              ("defended_blocks", f"defended blocks (of {N_BLOCKS})")]
+    conds = list(CONDITIONS)
+    fig, axes = plt.subplots(len(panels), 1, figsize=(12, 8.6), sharex=True)
+    width = 0.8 / len(POLICIES)
+    for ax, (col, label) in zip(axes, panels):
+        for c, cond in enumerate(conds):
+            for k, p in enumerate(POLICIES):
+                v = per_run[(per_run.condition == cond) & (per_run.policy == p)][col].to_numpy(float)
+                if not len(v):
+                    continue
+                x = c - 0.4 + width * (k + 0.5)
+                ax.scatter(np.full(len(v), x), v, s=16, color=POLICY_COLOR[p], edgecolor=SURFACE, linewidth=0.6, zorder=3)
+                ax.plot([x - width * 0.4, x + width * 0.4], [np.nanmean(v)] * 2, color=POLICY_COLOR[p], linewidth=2.2)
+        ax.set_ylabel(label)
+        if col == "clean_vs_on_pts":
+            ax.axhline(0, color=INK2, linewidth=0.8)
+    axes[-1].set_xticks(range(len(conds)), [c if c != "none" else "no attack" for c in conds])
+    handles = [Line2D([], [], color=POLICY_COLOR[p], marker="o", linewidth=2, label=POLICY_LABEL[p]) for p in POLICIES]
+    fig.legend(handles=handles, loc="upper left", bbox_to_anchor=(0.01, 0.955), ncol=3, fontsize=8)
+    fig.suptitle("Deployment summary: dots = seeds (2 early + 2 late windows per condition), bar = mean",
+                 fontsize=10, color=INK, x=0.01, y=0.995, ha="left")
+    fig.tight_layout(rect=(0, 0, 1, 0.9))
+    fig.savefig(out / "summary_by_policy.png", dpi=130)
+    plt.close(fig)
+
+
+def report(out: Path) -> None:
+    blocks = pd.concat([pd.read_csv(f) for f in sorted((out / "runs").glob("*/blocks.csv"))], ignore_index=True)
+    blocks.to_csv(out / "blocks_all.csv", index=False)
+    per_run, agg = summarize(blocks)
+    per_run.to_csv(out / "summary_runs.csv", index=False)
+    agg.to_csv(out / "summary_by_policy.csv", index=False)
+    for cond in CONDITIONS:
+        if (blocks.condition == cond).any():
+            fig_condition(blocks, cond, out)
+    fig_summary(per_run, out)
+    pd.set_option("display.width", 240)
+    pd.set_option("display.max_columns", 30)
+    print(agg.to_string(index=False))
+
+
+def main() -> None:
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--gru", type=Path, default=ROOT / "results/xp3/gru", help="folder with gru.pt + report.json")
+    ap.add_argument("--jobs", type=int, default=3)
+    ap.add_argument("--out", type=Path, default=OUT)
+    ap.add_argument("--policies", nargs="*", default=POLICIES)
+    ap.add_argument("--conditions", nargs="*", default=list(CONDITIONS))
+    ap.add_argument("--seeds", type=int, default=SEEDS_PER_CONDITION, help="environments per condition (smoke tests)")
+    ap.add_argument("--report-only", action="store_true")
+    args = ap.parse_args()
+    sys.stdout.reconfigure(encoding="utf-8")
+    args.out.mkdir(parents=True, exist_ok=True)
+    if not args.report_only:
+        weights = (args.gru / "gru.pt").resolve()
+        train = pd.read_csv(TRAIN_RUNS)
+        stats = Data(train[assign_splits(train) == "train"])  # the GRU's own input normalisation
+        jobs = [(c, p, k) for p in args.policies for c in args.conditions for k in range(args.seeds)]
+        started = time.time()
+        with ProcessPoolExecutor(max_workers=args.jobs, mp_context=get_context("spawn")) as pool:
+            futs = [pool.submit(run_one, c, p, k, str(weights), stats.x_mean, stats.x_std, str(args.out))
+                    for c, p, k in jobs]
+            for n, fut in enumerate(as_completed(futs), 1):
+                run_id, wall = fut.result()
+                print(f"[{n}/{len(jobs)}] {run_id}  {wall:.0f}s  (elapsed {time.time() - started:.0f}s)", flush=True)
+    report(args.out)
+
+
+if __name__ == "__main__":
+    main()
+__KRUM_TESTBED_EOF__
 
 # ---------------------------------------------------------------------------
 # 3. Tests (reproducibility, schedule dispatch, labels). Stops here on failure.
@@ -1289,6 +2750,57 @@ run_xp3() {
   echo "== saved $(dirname "$WORK")/results_xp3.zip"
 }
 
+# GRU candidates for xp3: name hidden lr weight_decay. xp1/xp2 settings (64, 2e-3, 0) overfit xp3 after 2 epochs.
+XP3_SWEEP=("a 64 5e-4 0" "b 32 5e-4 1e-3" "c 64 2e-4 1e-2" "d 128 5e-4 1e-2")
+
+find_xp3_data() {
+  if [ -n "${XP3_DATA:-}" ]; then echo "$XP3_DATA"; return; fi
+  local f
+  f=$(find /kaggle/input -path '*runs_xp3/all_blocks.csv' 2>/dev/null | head -1)
+  [ -z "$f" ] && f=$(find /kaggle/input -name all_blocks.csv 2>/dev/null | head -1)
+  if [ -z "$f" ]; then  # a zip that Kaggle did not extract
+    local z; z=$(find /kaggle/input -name 'results_xp3*.zip' 2>/dev/null | head -1)
+    if [ -n "$z" ]; then unzip -qo "$z" 'runs_xp3/all_blocks.csv' -d "$WORK/xp3_unzipped" && f="$WORK/xp3_unzipped/runs_xp3/all_blocks.csv"; fi
+  fi
+  echo "$f"
+}
+
+run_xp3_deploy() {
+  local data; data=$(find_xp3_data)
+  if [ -z "$data" ] || [ ! -f "$data" ]; then
+    echo "xp3 data not found: attach results_xp3.zip as a dataset (Add Input) or set XP3_DATA=/path/all_blocks.csv"; exit 1
+  fi
+  mkdir -p results/xp3/runs_xp3 results/xp3/gru_sweep
+  cp "$data" results/xp3/runs_xp3/all_blocks.csv
+  "$PY" - <<'PYCHECK'
+import pandas as pd
+d = pd.read_csv("results/xp3/runs_xp3/all_blocks.csv")
+n = d.run_id.nunique(); rows = d.groupby("run_id").size().unique()
+print(f"xp3 data: {n} runs, rows per run {rows}")
+if n != 400 or list(rows) != [251]:
+    raise SystemExit("unexpected xp3 data: expected 400 runs x 251 rows")
+PYCHECK
+  echo "== xp3_deploy 1/3: GRU sweep on xp3 (${#XP3_SWEEP[@]} models, one at a time)"
+  for cfg in "${XP3_SWEEP[@]}"; do
+    set -- $cfg
+    if [ -f "results/xp3/gru_sweep/$1/report.json" ]; then echo "   model $1 already trained"; continue; fi
+    rm -rf "results/xp3/gru_sweep/$1"
+    echo "   model $1: hidden $2, lr $3, weight decay $4"
+    "$PY" -u gru_experiment.py --runs results/xp3/runs_xp3/all_blocks.csv --out "results/xp3/gru_sweep/$1" \
+      --hidden "$2" --lr "$3" --wd "$4" --patience 40 > "results/xp3/gru_sweep/$1.log" 2>&1 \
+      || { echo "   model $1 failed:"; tail -20 "results/xp3/gru_sweep/$1.log"; exit 1; }
+    grep -E "^model:" "results/xp3/gru_sweep/$1.log"
+  done
+  echo "== xp3_deploy 2/3: model selection on validation seeds (check P: hold vs keep probing)"
+  "$PY" -u check_probe.py --select results/xp3/gru_sweep/a results/xp3/gru_sweep/b results/xp3/gru_sweep/c results/xp3/gru_sweep/d
+  local sel; sel=$("$PY" -c "import json; print(json.load(open('results/xp3/gru_selected.json'))['selected'])")
+  echo "== xp3_deploy 3/3: deployment with $sel (6 policies x 4 conditions x 4 seeds = 96 runs)"
+  "$PY" -u deploy_xp3.py --gru "$sel" --jobs "$JOBS" | tee results/deploy_xp3_log.txt
+  (cd "$WORK" && zip -qr "$WORK/../xp3_deploy.zip" results/xp3/gru_sweep results/xp3/gru_selected.json \
+     results/deploy_xp3 results/deploy_xp3_log.txt)
+  echo "== saved $(dirname "$WORK")/xp3_deploy.zip"
+}
+
 SECONDS=0
 case "$STAGE" in
   sanity)         run_sanity ;;
@@ -1297,5 +2809,6 @@ case "$STAGE" in
   counterfactual) run_counterfactual ;;
   xp2)            run_xp2 ;;
   xp3)            run_xp3 ;;
+  xp3_deploy)     run_xp3_deploy ;;
 esac
 echo "== done in $((SECONDS / 60)) min"

@@ -39,14 +39,14 @@ from pathlib import Path
 import matplotlib
 
 matplotlib.use("Agg")
-import matplotlib.pyplot as plt  # noqa: E402
-import numpy as np  # noqa: E402
-import pandas as pd  # noqa: E402
-import torch  # noqa: E402
-from torch import nn  # noqa: E402
+import matplotlib.pyplot as plt 
+import numpy as np 
+import pandas as pd 
+import torch 
+from torch import nn 
 
-import analyze  # noqa: E402
-from analyze import DEFENSES, INK, INK2, SERIES, X_COLS  # noqa: E402
+import analyze 
+from analyze import DEFENSES, INK, INK2, SERIES, X_COLS 
 
 Y_COLS = ["y_clean_acc", "y_atk"]
 CF_PREFIX = 3
@@ -165,11 +165,16 @@ def cut_predictions(model: OutcomeGRU, enc_x: torch.Tensor, dec_x: torch.Tensor,
 
 
 def fit_gru(tr: Data, va: Data, device: torch.device, epochs: int, hidden: int, seed: int,
-            cuts_per_batch: int = CUTS_PER_BATCH) -> tuple[OutcomeGRU, list]:
-    """Masked MSE over (cut, future block); early stopping on validation seeds (patience 25)."""
+            cuts_per_batch: int = CUTS_PER_BATCH, lr: float = 2e-3, weight_decay: float = 0.0,
+            patience_max: int = 25) -> tuple[OutcomeGRU, list]:
+    """Masked MSE over (cut, future block); early stopping on validation seeds (patience 25 by default).
+
+    lr / weight_decay default to the xp1/xp2 settings (Adam, 2e-3, none); xp3 overfits with them.
+    """
     torch.manual_seed(seed)
     model = OutcomeGRU(tr.enc.shape[-1], tr.dec_inputs(tr.W).shape[-1], hidden).to(device)
-    opt = torch.optim.Adam(model.parameters(), lr=2e-3)
+    opt = (torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay) if weight_decay
+           else torch.optim.Adam(model.parameters(), lr=lr))
     tr_dec, va_dec = tr.dec_inputs(tr.W), va.dec_inputs(va.W)
     n_cuts = tr.n_rows - 1
     va_cuts = torch.arange(0, n_cuts, max(1, n_cuts // 50))  # fixed, evenly spaced: a stable validation loss
@@ -199,7 +204,7 @@ def fit_gru(tr: Data, va: Data, device: torch.device, epochs: int, hidden: int, 
             best_state = {k: t.detach().clone() for k, t in model.state_dict().items()}
         else:
             patience += 1
-            if patience >= 25:
+            if patience >= patience_max:
                 break
     model.load_state_dict(best_state)
     return model, history
@@ -479,6 +484,9 @@ def main() -> None:
     ap.add_argument("--cuts-per-batch", type=int, default=CUTS_PER_BATCH)
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--boot", type=int, default=500)
+    ap.add_argument("--lr", type=float, default=2e-3)
+    ap.add_argument("--wd", type=float, default=0.0, help="AdamW weight decay (0 = Adam, as in xp1/xp2)")
+    ap.add_argument("--patience", type=int, default=25)
     args = ap.parse_args()
     if args.cf and args.retrain:
         raise SystemExit("--retrain with --cf would score check 3 with a model fitted after the runs existed.")
@@ -504,7 +512,8 @@ def main() -> None:
     elif args.cf:
         raise SystemExit(f"No frozen model at {weights}: train it first (without --cf).")
     else:
-        model, history = fit_gru(train, val, device, args.epochs, args.hidden, args.seed, args.cuts_per_batch)
+        model, history = fit_gru(train, val, device, args.epochs, args.hidden, args.seed, args.cuts_per_batch,
+                                 args.lr, args.wd, args.patience)
         model.eval()
         torch.save(model.state_dict(), weights)
     weights_sha = hashlib.sha256(weights.read_bytes()).hexdigest()[:16]
@@ -514,6 +523,8 @@ def main() -> None:
     c1 = check1(model, ridge, train, test, device)
     c1.to_csv(args.out / "check1_prediction.csv", index=False)
     report = {"weights_sha256": weights_sha, "n_blocks": train.n_blocks, "support": support(df),
+              "hparams": {"hidden": args.hidden, "lr": args.lr, "wd": args.wd, "patience": args.patience,
+                          "cuts_per_batch": args.cuts_per_batch, "seed": args.seed},
               "epochs": len(history), "best_val_mse": min(history), "val_history": history}
     c2 = check2(model, df, test, device, args.out, args.boot) if is_xp1_shaped(df, test) else None
     if c2 is not None:

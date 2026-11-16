@@ -4,7 +4,7 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 OUT=run_kaggle.sh
 DELIM=__KRUM_TESTBED_EOF__
-FILES=(poison_testbed/*.py run_experiment.py tests/test_testbed.py)
+FILES=(poison_testbed/*.py run_experiment.py tests/test_testbed.py analyze.py gru_experiment.py check_probe.py deploy_xp3.py)
 
 if grep -l "$DELIM" "${FILES[@]}"; then echo "delimiter found in a source file" >&2; exit 1; fi
 {
