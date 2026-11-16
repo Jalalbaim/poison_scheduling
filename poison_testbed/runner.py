@@ -6,7 +6,7 @@ import math
 import re
 import subprocess
 import time
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 from pathlib import Path
 from typing import Any, Callable
 
@@ -44,7 +44,7 @@ DEFENSES: dict[str, type[Aggregator]] = {
 }
 
 COLUMNS = [
-    "run_id", "seed", "schedule_seed", "defense", "attack", "n", "f",
+    "run_id", "seed", "schedule_seed", "defense", "attack", "poison_frac", "n", "f",
     "block", "round_start", "lr", "W",
     *X_COLUMNS, "x_val_acc",
     "y_clean_acc", "y_clean_loss", "y_atk",
@@ -75,6 +75,10 @@ class RunConfig:
     window: tuple[int, int] = (15, 30)
     sign_flip_scale: float = 1.0
     alie_z: float | str = "max"
+    burst: tuple[int, int] | None = None  # backdoor_burst: (period, on) blocks inside the window
+    # Measure backdoor success (y_atk) even without a trigger attack, e.g. in no-attack runs (xp3). It then
+    # reads as the base rate (~1%), which teaches a model that without an attack the backdoor stays at 0.
+    always_measure_backdoor: bool = False
     device: str = field(default_factory=lambda: "cuda" if torch.cuda.is_available() else "cpu")
 
     @property
@@ -87,11 +91,21 @@ class RunConfig:
         return f"{self.attack}__{self.defense}{tag}__s{self.seed:03d}"
 
     def hash(self) -> str:
-        payload = json.dumps({**asdict(self), "_v": TESTBED_VERSION}, sort_keys=True, default=str)
+        fields = asdict(self)
+        # Fields added after xp1/xp2: left out while at their default, so every earlier config's hash is unchanged.
+        for name, default in LATER_FIELDS.items():
+            if fields[name] == default:
+                del fields[name]
+        payload = json.dumps({**fields, "_v": TESTBED_VERSION}, sort_keys=True, default=str)
         return hashlib.sha256(payload.encode()).hexdigest()[:16]
 
 
+LATER_FIELDS = {"burst": None, "always_measure_backdoor": False}
+
 CF_SCHEDULE = re.compile(r"cf_(on|off|ontil20|offtil20|alt)_p(\d+)")
+PROBE_SCHEDULE = re.compile(r"probe_P(\d+)_L(\d+)_o(\d+)")
+PROBEHOLD_SCHEDULE = re.compile(r"probehold_P(\d+)_L(\d+)_o(\d+)_d(-?\d+)_e(\d+)")
+FLIP_SUFFIX = re.compile(r"(.+)\+flip_s(\d+)_l(\d+)")
 STICKY_SCHEDULE = re.compile(r"sticky_p([0-9.]+)")
 REACT_SCHEDULE = re.compile(r"react_d(-?\d+)_e(\d+)")
 
@@ -113,7 +127,27 @@ def counterfactual_schedule(name: str, prefix: int, n_blocks: int) -> list[int]:
     return [1] * prefix + cont
 
 
+def probe_schedule(period: int, length: int, offset: int, n_blocks: int) -> list[int]:
+    """Short defenses to look: defend `length` blocks out of every `period`, starting at `offset`."""
+    return [int((b - offset) % period < length) if b >= offset else 0 for b in range(n_blocks)]
+
+
 def make_schedule(cfg: RunConfig) -> list[int]:
+    if m := FLIP_SUFFIX.fullmatch(cfg.schedule):
+        # Paired twin: the base schedule with W flipped on blocks [s, s + l). Same seed, so the pair gives the
+        # true effect of that short change.
+        base = make_schedule(replace(cfg, schedule=m.group(1)))
+        s, ln = int(m.group(2)), int(m.group(3))
+        return [1 - w if s <= b < s + ln else w for b, w in enumerate(base)]
+    if m := PROBE_SCHEDULE.fullmatch(cfg.schedule):
+        return probe_schedule(int(m.group(1)), int(m.group(2)), int(m.group(3)), cfg.n_blocks)
+    if m := PROBEHOLD_SCHEDULE.fullmatch(cfg.schedule):
+        # Probe; from window start + d hold the defense on through window end + e; then probe again. Follows
+        # cfg.window whether or not an attack happens (phantom window in no-attack runs).
+        period, length, offset, d, e = (int(g) for g in m.groups())
+        out = probe_schedule(period, length, offset, cfg.n_blocks)
+        on, off = cfg.window[0] + d, cfg.window[1] + e
+        return [1 if on <= b <= off else w for b, w in enumerate(out)]
     if cfg.schedule == "on":
         return [1] * cfg.n_blocks
     if cfg.schedule == "off":
@@ -123,6 +157,10 @@ def make_schedule(cfg: RunConfig) -> list[int]:
         return torch.bernoulli(torch.full((cfg.n_blocks,), 0.5), generator=gen).int().tolist()
     if cfg.schedule == "policy":
         return [0] * cfg.n_blocks  # placeholder: each entry is set online by the policy before its block runs
+    if cfg.schedule == "oracle":
+        # Defend exactly the blocks where the attack is active (knows the attack: an upper reference only).
+        spec = make_attack(cfg.attack, window=cfg.window, burst=cfg.burst)
+        return [int(spec.active(b)) for b in range(cfg.n_blocks)]
     if m := STICKY_SCHEDULE.fullmatch(cfg.schedule):
         # Two-state Markov chain: random initial state, switch with probability p before each block.
         gen = torch.Generator().manual_seed(cfg.sched_seed)
@@ -152,7 +190,8 @@ def defense_kwargs(cfg: RunConfig) -> dict[str, Any]:
 def build(cfg: RunConfig) -> PoisoningSimulation:
     torch.use_deterministic_algorithms(True)
     data = load_mnist(cfg.device, cfg.patch_size, cfg.target)
-    spec = make_attack(cfg.attack, sign_flip_scale=cfg.sign_flip_scale, alie_z=cfg.alie_z, window=cfg.window)
+    spec = make_attack(cfg.attack, sign_flip_scale=cfg.sign_flip_scale, alie_z=cfg.alie_z, window=cfg.window,
+                       burst=cfg.burst)
     sim = PoisoningSimulation(
         attack_spec=spec,
         corrupt_kwargs={"poison_frac": cfg.poison_frac, "patch_size": cfg.patch_size, "target": cfg.target},
@@ -181,7 +220,8 @@ def _outcomes(sim: PoisoningSimulation, cfg: RunConfig) -> dict[str, float]:
     data = load_mnist(cfg.device, cfg.patch_size, cfg.target)
     val_acc, _ = sim.accuracy_loss(*data.val)
     acc, loss = sim.accuracy_loss(*data.test)
-    y_atk = sim.target_rate(data.triggered[0], cfg.target) if sim.attack_spec.has_trigger else math.nan
+    measure = sim.attack_spec.has_trigger or cfg.always_measure_backdoor
+    y_atk = sim.target_rate(data.triggered[0], cfg.target) if measure else math.nan
     return {"x_val_acc": val_acc, "y_clean_acc": acc, "y_clean_loss": loss, "y_atk": y_atk}
 
 
@@ -204,7 +244,7 @@ def simulate(cfg: RunConfig, policy: Policy | None = None) -> pd.DataFrame:
     """
     sim = build(cfg)
     base = {"run_id": cfg.run_id, "seed": cfg.seed, "schedule_seed": cfg.sched_seed, "defense": cfg.defense,
-            "attack": cfg.attack, "n": cfg.n, "f": cfg.f}
+            "attack": cfg.attack, "poison_frac": cfg.poison_frac, "n": cfg.n, "f": cfg.f}
     rows = [{**base, "block": -1, "round_start": pd.NA, "lr": sim._current_lr, "W": pd.NA,
              **{c: math.nan for c in X_COLUMNS}, **_outcomes(sim, cfg), "u_active": 0, "u_type": "none"}]
     extra_cols: list[str] = []

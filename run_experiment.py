@@ -172,9 +172,9 @@ XP3_ATTACKS = {  # name -> (attack, poison_frac, share)
 }
 XP3_FAMILIES = {"sticky": 0.25, "react": 0.25, "probe": 0.175, "probehold": 0.175, "on": 0.075, "off": 0.075}
 XP3_STICKY_P = [0.01, 0.02, 0.05, 0.1]
-XP3_REACT_DELAY = [-4, 0, 2, 5, 10, 20, 30, 40]  # blocks (2 rounds) after the window start
+XP3_REACT_DELAY = [-4, 0, 1, 2, 5, 10, 20, 40]  # blocks (2 rounds) after the window start; erasable up to ~1 (8/8), ~5 (2/8), ~10 (1/8)
 XP3_EXTRA = [0, 2, 5, 10]
-XP3_PROBE_PERIOD = [5, 10, 20, 40]  # blocks between probes (set from measure_erasure.py)
+XP3_PROBE_PERIOD = [3, 5, 10, 20]  # blocks between probes: from measure_erasure.py, a probe must come within ~10 (1/8), ~5 (2/8), ~1 (8/8) blocks of the attack start; 20 = too slow (negative examples)
 XP3_PROBE_LEN = [1, 2, 4]  # blocks per probe
 
 

@@ -8,6 +8,7 @@
 #     !bash run_kaggle.sh all        # both, in sequence
 #     !bash run_kaggle.sh counterfactual   # GRU check 3: 384 runs, test seeds x candidate schedules
 #     !bash run_kaggle.sh xp2              # xp2: 260 runs, windowed backdoor + Krum, data with kills
+#     !bash run_kaggle.sh xp3              # xp3: 400 runs, stealthy backdoors, probes, paired twins
 #
 # Optional environment variables:
 #     JOBS=4          parallel runs (default: number of CPUs)
@@ -22,7 +23,7 @@
 set -euo pipefail
 
 STAGE="${1:-sanity}"
-case "$STAGE" in sanity|collect|all|counterfactual|xp2) ;; *) echo "usage: $0 [sanity|collect|all|counterfactual|xp2]"; exit 2;; esac
+case "$STAGE" in sanity|collect|all|counterfactual|xp2|xp3) ;; *) echo "usage: $0 [sanity|collect|all|counterfactual|xp2|xp3]"; exit 2;; esac
 if [ -d /kaggle/working ]; then DEFAULT_WORK=/kaggle/working/testbed; else DEFAULT_WORK="$PWD/testbed"; fi
 WORK="${WORK:-$DEFAULT_WORK}"
 JOBS="${JOBS:-$(nproc)}"
@@ -282,16 +283,30 @@ class AttackSpec:
     attack_kwargs: dict[str, Any] = field(default_factory=dict)
     window: tuple[int, int] | None = None  # inclusive block range; None = always
     has_trigger: bool = False  # y_atk defined
+    burst: tuple[int, int] | None = None  # (period, on): inside the window, active `on` blocks of every `period`
 
     def active(self, block: int) -> bool:
         if self.kind == "none":
             return False
-        return self.window is None or self.window[0] <= block <= self.window[1]
+        if self.window is not None and not self.window[0] <= block <= self.window[1]:
+            return False
+        if self.burst is not None:
+            period, on = self.burst
+            start = self.window[0] if self.window is not None else 0
+            return (block - start) % period < on
+        return True
 
 
 def make_attack(name: str, *, sign_flip_scale: float = 1.0, alie_z: float | str = "max",
-                window: tuple[int, int] = (15, 30)) -> AttackSpec:
-    """Build the named condition. Hyperparameters of the corruptions live in the run config."""
+                window: tuple[int, int] = (15, 30), burst: tuple[int, int] | None = None) -> AttackSpec:
+    """Build the named condition. Hyperparameters of the corruptions live in the run config.
+
+    ``backdoor_burst``: the backdoor, active inside ``window`` only during bursts (``burst`` = (period, on)).
+    """
+    if name == "backdoor_burst":
+        if burst is None:
+            raise ValueError("backdoor_burst needs burst=(period, on)")
+        return AttackSpec("backdoor_burst", "data", corrupt=backdoor, has_trigger=True, window=window, burst=burst)
     specs = {
         "none": AttackSpec("none", "none"),
         "label_flip": AttackSpec("label_flip", "data", corrupt=label_flip),
@@ -314,7 +329,7 @@ import math
 import re
 import subprocess
 import time
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 from pathlib import Path
 from typing import Any, Callable
 
@@ -352,7 +367,7 @@ DEFENSES: dict[str, type[Aggregator]] = {
 }
 
 COLUMNS = [
-    "run_id", "seed", "schedule_seed", "defense", "attack", "n", "f",
+    "run_id", "seed", "schedule_seed", "defense", "attack", "poison_frac", "n", "f",
     "block", "round_start", "lr", "W",
     *X_COLUMNS, "x_val_acc",
     "y_clean_acc", "y_clean_loss", "y_atk",
@@ -383,6 +398,10 @@ class RunConfig:
     window: tuple[int, int] = (15, 30)
     sign_flip_scale: float = 1.0
     alie_z: float | str = "max"
+    burst: tuple[int, int] | None = None  # backdoor_burst: (period, on) blocks inside the window
+    # Measure backdoor success (y_atk) even without a trigger attack, e.g. in no-attack runs (xp3). It then
+    # reads as the base rate (~1%), which teaches a model that without an attack the backdoor stays at 0.
+    always_measure_backdoor: bool = False
     device: str = field(default_factory=lambda: "cuda" if torch.cuda.is_available() else "cpu")
 
     @property
@@ -395,11 +414,21 @@ class RunConfig:
         return f"{self.attack}__{self.defense}{tag}__s{self.seed:03d}"
 
     def hash(self) -> str:
-        payload = json.dumps({**asdict(self), "_v": TESTBED_VERSION}, sort_keys=True, default=str)
+        fields = asdict(self)
+        # Fields added after xp1/xp2: left out while at their default, so every earlier config's hash is unchanged.
+        for name, default in LATER_FIELDS.items():
+            if fields[name] == default:
+                del fields[name]
+        payload = json.dumps({**fields, "_v": TESTBED_VERSION}, sort_keys=True, default=str)
         return hashlib.sha256(payload.encode()).hexdigest()[:16]
 
 
+LATER_FIELDS = {"burst": None, "always_measure_backdoor": False}
+
 CF_SCHEDULE = re.compile(r"cf_(on|off|ontil20|offtil20|alt)_p(\d+)")
+PROBE_SCHEDULE = re.compile(r"probe_P(\d+)_L(\d+)_o(\d+)")
+PROBEHOLD_SCHEDULE = re.compile(r"probehold_P(\d+)_L(\d+)_o(\d+)_d(-?\d+)_e(\d+)")
+FLIP_SUFFIX = re.compile(r"(.+)\+flip_s(\d+)_l(\d+)")
 STICKY_SCHEDULE = re.compile(r"sticky_p([0-9.]+)")
 REACT_SCHEDULE = re.compile(r"react_d(-?\d+)_e(\d+)")
 
@@ -421,7 +450,27 @@ def counterfactual_schedule(name: str, prefix: int, n_blocks: int) -> list[int]:
     return [1] * prefix + cont
 
 
+def probe_schedule(period: int, length: int, offset: int, n_blocks: int) -> list[int]:
+    """Short defenses to look: defend `length` blocks out of every `period`, starting at `offset`."""
+    return [int((b - offset) % period < length) if b >= offset else 0 for b in range(n_blocks)]
+
+
 def make_schedule(cfg: RunConfig) -> list[int]:
+    if m := FLIP_SUFFIX.fullmatch(cfg.schedule):
+        # Paired twin: the base schedule with W flipped on blocks [s, s + l). Same seed, so the pair gives the
+        # true effect of that short change.
+        base = make_schedule(replace(cfg, schedule=m.group(1)))
+        s, ln = int(m.group(2)), int(m.group(3))
+        return [1 - w if s <= b < s + ln else w for b, w in enumerate(base)]
+    if m := PROBE_SCHEDULE.fullmatch(cfg.schedule):
+        return probe_schedule(int(m.group(1)), int(m.group(2)), int(m.group(3)), cfg.n_blocks)
+    if m := PROBEHOLD_SCHEDULE.fullmatch(cfg.schedule):
+        # Probe; from window start + d hold the defense on through window end + e; then probe again. Follows
+        # cfg.window whether or not an attack happens (phantom window in no-attack runs).
+        period, length, offset, d, e = (int(g) for g in m.groups())
+        out = probe_schedule(period, length, offset, cfg.n_blocks)
+        on, off = cfg.window[0] + d, cfg.window[1] + e
+        return [1 if on <= b <= off else w for b, w in enumerate(out)]
     if cfg.schedule == "on":
         return [1] * cfg.n_blocks
     if cfg.schedule == "off":
@@ -431,6 +480,10 @@ def make_schedule(cfg: RunConfig) -> list[int]:
         return torch.bernoulli(torch.full((cfg.n_blocks,), 0.5), generator=gen).int().tolist()
     if cfg.schedule == "policy":
         return [0] * cfg.n_blocks  # placeholder: each entry is set online by the policy before its block runs
+    if cfg.schedule == "oracle":
+        # Defend exactly the blocks where the attack is active (knows the attack: an upper reference only).
+        spec = make_attack(cfg.attack, window=cfg.window, burst=cfg.burst)
+        return [int(spec.active(b)) for b in range(cfg.n_blocks)]
     if m := STICKY_SCHEDULE.fullmatch(cfg.schedule):
         # Two-state Markov chain: random initial state, switch with probability p before each block.
         gen = torch.Generator().manual_seed(cfg.sched_seed)
@@ -460,7 +513,8 @@ def defense_kwargs(cfg: RunConfig) -> dict[str, Any]:
 def build(cfg: RunConfig) -> PoisoningSimulation:
     torch.use_deterministic_algorithms(True)
     data = load_mnist(cfg.device, cfg.patch_size, cfg.target)
-    spec = make_attack(cfg.attack, sign_flip_scale=cfg.sign_flip_scale, alie_z=cfg.alie_z, window=cfg.window)
+    spec = make_attack(cfg.attack, sign_flip_scale=cfg.sign_flip_scale, alie_z=cfg.alie_z, window=cfg.window,
+                       burst=cfg.burst)
     sim = PoisoningSimulation(
         attack_spec=spec,
         corrupt_kwargs={"poison_frac": cfg.poison_frac, "patch_size": cfg.patch_size, "target": cfg.target},
@@ -489,7 +543,8 @@ def _outcomes(sim: PoisoningSimulation, cfg: RunConfig) -> dict[str, float]:
     data = load_mnist(cfg.device, cfg.patch_size, cfg.target)
     val_acc, _ = sim.accuracy_loss(*data.val)
     acc, loss = sim.accuracy_loss(*data.test)
-    y_atk = sim.target_rate(data.triggered[0], cfg.target) if sim.attack_spec.has_trigger else math.nan
+    measure = sim.attack_spec.has_trigger or cfg.always_measure_backdoor
+    y_atk = sim.target_rate(data.triggered[0], cfg.target) if measure else math.nan
     return {"x_val_acc": val_acc, "y_clean_acc": acc, "y_clean_loss": loss, "y_atk": y_atk}
 
 
@@ -512,7 +567,7 @@ def simulate(cfg: RunConfig, policy: Policy | None = None) -> pd.DataFrame:
     """
     sim = build(cfg)
     base = {"run_id": cfg.run_id, "seed": cfg.seed, "schedule_seed": cfg.sched_seed, "defense": cfg.defense,
-            "attack": cfg.attack, "n": cfg.n, "f": cfg.f}
+            "attack": cfg.attack, "poison_frac": cfg.poison_frac, "n": cfg.n, "f": cfg.f}
     rows = [{**base, "block": -1, "round_start": pd.NA, "lr": sim._current_lr, "W": pd.NA,
              **{c: math.nan for c in X_COLUMNS}, **_outcomes(sim, cfg), "u_active": 0, "u_type": "none"}]
     extra_cols: list[str] = []
@@ -764,6 +819,7 @@ cat > run_experiment.py <<'__KRUM_TESTBED_EOF__'
     python run_experiment.py collect [--jobs 3]        # Step 3: random Bernoulli(0.5) schedules, 20 seeds
     python run_experiment.py counterfactual            # GRU check 3: test seeds x candidate schedules
     python run_experiment.py xp2 [--jobs 4]            # xp2: windowed backdoor + Krum, data with kills
+    python run_experiment.py xp3 [--jobs 4]            # xp3: stealthy backdoors, probes, paired twins
     python run_experiment.py report                    # Step 2 table from runs_sanity/
 
 Any RunConfig field can be overridden with --set key=value (e.g. --set sigma=0.02 --set sign_flip_scale=5).
@@ -921,6 +977,73 @@ def cmd_xp2(args: argparse.Namespace) -> None:
     execute(configs, ROOT / (args.out or "runs_xp2"), args.jobs)
 
 
+XP3_MAIN, XP3_TWINS, XP3_SEED0 = 320, 80, 10_000
+XP3_ATTACKS = {  # name -> (attack, poison_frac, share)
+    "pf1/8": ("backdoor_win", 0.125, 0.35),
+    "pf2/8": ("backdoor_win", 0.25, 0.25),
+    "pf8/8": ("backdoor_win", 1.0, 0.15),
+    "none": ("none", 1.0, 0.25),
+}
+XP3_FAMILIES = {"sticky": 0.25, "react": 0.25, "probe": 0.175, "probehold": 0.175, "on": 0.075, "off": 0.075}
+XP3_STICKY_P = [0.01, 0.02, 0.05, 0.1]
+XP3_REACT_DELAY = [-4, 0, 1, 2, 5, 10, 20, 40]  # blocks (2 rounds) after the window start; erasable up to ~1 (8/8), ~5 (2/8), ~10 (1/8)
+XP3_EXTRA = [0, 2, 5, 10]
+XP3_PROBE_PERIOD = [3, 5, 10, 20]  # blocks between probes: from measure_erasure.py, a probe must come within ~10 (1/8), ~5 (2/8), ~1 (8/8) blocks of the attack start; 20 = too slow (negative examples)
+XP3_PROBE_LEN = [1, 2, 4]  # blocks per probe
+
+
+def xp3_main_config(i: int, overrides: dict) -> RunConfig:
+    """Main run i of xp3 (seed XP3_SEED0 + i): attack, window (real or phantom) and schedule drawn per run."""
+    rng = np.random.default_rng(30_000 + i)  # per-run stream
+    names = list(XP3_ATTACKS)
+    attack, pf, _ = XP3_ATTACKS[names[rng.choice(len(names), p=[v[2] for v in XP3_ATTACKS.values()])]]
+    start = int(rng.integers(2, 21)) if rng.random() < 0.3 else int(rng.integers(21, 151))  # ~30% early
+    window = (start, start + int(rng.integers(30, 81)) - 1)
+    family = rng.choice(list(XP3_FAMILIES), p=list(XP3_FAMILIES.values()))
+    if family == "sticky":
+        schedule = f"sticky_p{rng.choice(XP3_STICKY_P)}"
+    elif family == "react":
+        schedule = f"react_d{rng.choice(XP3_REACT_DELAY)}_e{rng.choice(XP3_EXTRA)}"
+    elif family in ("probe", "probehold"):
+        period, length = int(rng.choice(XP3_PROBE_PERIOD)), int(rng.choice(XP3_PROBE_LEN))
+        length = min(length, period - 1)
+        schedule = f"probe_P{period}_L{length}_o{int(rng.integers(0, period))}"
+        if family == "probehold":
+            schedule = (f"probehold_P{period}_L{length}_o{int(rng.integers(0, period))}"
+                        f"_d{rng.choice(XP3_REACT_DELAY)}_e{rng.choice(XP3_EXTRA)}")
+    else:
+        schedule = str(family)
+    params = {"C": XP1_C, "sigma": DEFAULT_SIGMA, "block_len": XP2_BLOCK_LEN, "n_blocks": XP2_BLOCKS,
+              "always_measure_backdoor": True, **overrides}
+    return RunConfig(attack=attack, defense="Krum", seed=XP3_SEED0 + i, schedule=schedule, window=window,
+                     poison_frac=pf, **params)
+
+
+def xp3_configs(overrides: dict) -> list[RunConfig]:
+    """320 main runs + 80 paired twins. A twin = a main run with W flipped on 1-3 blocks (same seed, same data)."""
+    main = [xp3_main_config(i, overrides) for i in range(XP3_MAIN)]
+    rng = np.random.default_rng(31_000)
+    twins = []
+    for i in sorted(rng.choice(XP3_MAIN, XP3_TWINS, replace=False)):
+        base = main[i]
+        if rng.random() < 0.5:  # around the attack start, where short changes matter most
+            s = int(np.clip(base.window[0] + rng.integers(-5, 16), 0, XP2_BLOCKS - 1))
+        else:
+            s = int(rng.integers(0, XP2_BLOCKS))
+        ln = int(rng.integers(1, 4))
+        twins.append(RunConfig(**{**base.__dict__, "schedule": f"{base.schedule}+flip_s{s}_l{min(ln, XP2_BLOCKS - s)}"}))
+    return main + twins
+
+
+def cmd_xp3(args: argparse.Namespace) -> None:
+    """xp3: stealthy windowed backdoors (1/8, 2/8 poisoned), probe schedules, paired twins, backdoor measured in
+    every run."""
+    configs = xp3_configs(parse_overrides(args.set))
+    if args.seeds:
+        configs = configs[: args.seeds]
+    execute(configs, ROOT / (args.out or "runs_xp3"), args.jobs)
+
+
 def cmd_report(args: argparse.Namespace) -> None:
     """Step 2 table: final outcomes per (attack, arm), mean ± sd over seeds, and the on − off gaps."""
     root = ROOT / (args.out or "runs_sanity")
@@ -964,7 +1087,8 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = parser.add_subparsers(dest="cmd", required=True)
     for name, fn in [("calibrate", cmd_calibrate), ("sanity", cmd_sanity), ("collect", cmd_collect),
-                     ("counterfactual", cmd_counterfactual), ("xp2", cmd_xp2), ("report", cmd_report)]:
+                     ("counterfactual", cmd_counterfactual), ("xp2", cmd_xp2), ("xp3", cmd_xp3),
+                     ("report", cmd_report)]:
         sp = sub.add_parser(name)
         sp.set_defaults(fn=fn)
         sp.add_argument("--set", action="append", default=[], metavar="KEY=VALUE")
@@ -1074,6 +1198,31 @@ def test_sticky_and_react_schedules():
     assert early.index(1) == 36
 
 
+def test_xp3_schedules_and_backward_compatible_hash():
+    from poison_testbed.runner import make_schedule
+
+    base = dict(attack="none", defense="Krum", seed=5, C=1.0, sigma=0.0, n_blocks=60, block_len=2, window=(20, 39))
+    probe = make_schedule(RunConfig(schedule="probe_P10_L2_o3", **base))
+    assert [b for b, w in enumerate(probe) if w][:4] == [3, 4, 13, 14]
+    hold = make_schedule(RunConfig(schedule="probehold_P10_L2_o3_d2_e3", **base))
+    # probes before (block 3), hold over blocks 22..42, then probes resume (43-44, 53-54) with gaps between
+    assert hold[3] == 1 and all(hold[22:43]) and hold[45:53] == [0] * 8 and hold[53:55] == [1, 1]
+    twin = make_schedule(RunConfig(schedule="probe_P10_L2_o3+flip_s5_l2", **base))
+    assert [b for b, (a, t) in enumerate(zip(probe, twin)) if a != t] == [5, 6]
+    # New fields at their defaults leave the hash unchanged (xp1/xp2 configs stay valid).
+    cfg = RunConfig(**base)
+    assert cfg.hash() == RunConfig(**base, burst=None, always_measure_backdoor=False).hash()
+    assert cfg.hash() != RunConfig(**base, always_measure_backdoor=True).hash()
+
+
+def test_backdoor_measured_in_no_attack_runs_when_asked():
+    on = simulate(RunConfig(attack="none", defense="Krum", seed=0, always_measure_backdoor=True, **SHORT))
+    off = simulate(RunConfig(attack="none", defense="Krum", seed=0, **SHORT))
+    assert on.y_atk.notna().all() and on.y_atk.max() < 0.5  # base rate, no backdoor
+    assert off.y_atk.isna().all()
+    assert (on.poison_frac == 1.0).all()
+
+
 def test_no_attack_uses_all_workers_honestly():
     """attack=none with f=3: the 3 'Byzantine' workers are honest, so it equals an f=3 run whose window never opens."""
     a = simulate(RunConfig(attack="none", defense="Krum", seed=2, **SHORT))
@@ -1133,6 +1282,13 @@ run_xp2() {
   echo "== saved $(dirname "$WORK")/results_xp2.zip"
 }
 
+run_xp3() {
+  echo "== xp3: stealthy windowed backdoors (1/8, 2/8, 8/8) + no attack, probe schedules, 80 paired twins (400 runs)"
+  "$PY" -u run_experiment.py xp3 --jobs "$JOBS" $EXTRA
+  (cd "$WORK" && zip -qr "$WORK/../results_xp3.zip" runs_xp3)
+  echo "== saved $(dirname "$WORK")/results_xp3.zip"
+}
+
 SECONDS=0
 case "$STAGE" in
   sanity)         run_sanity ;;
@@ -1140,5 +1296,6 @@ case "$STAGE" in
   all)            run_sanity; run_collect ;;
   counterfactual) run_counterfactual ;;
   xp2)            run_xp2 ;;
+  xp3)            run_xp3 ;;
 esac
 echo "== done in $((SECONDS / 60)) min"

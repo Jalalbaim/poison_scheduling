@@ -87,6 +87,31 @@ def test_sticky_and_react_schedules():
     assert early.index(1) == 36
 
 
+def test_xp3_schedules_and_backward_compatible_hash():
+    from poison_testbed.runner import make_schedule
+
+    base = dict(attack="none", defense="Krum", seed=5, C=1.0, sigma=0.0, n_blocks=60, block_len=2, window=(20, 39))
+    probe = make_schedule(RunConfig(schedule="probe_P10_L2_o3", **base))
+    assert [b for b, w in enumerate(probe) if w][:4] == [3, 4, 13, 14]
+    hold = make_schedule(RunConfig(schedule="probehold_P10_L2_o3_d2_e3", **base))
+    # probes before (block 3), hold over blocks 22..42, then probes resume (43-44, 53-54) with gaps between
+    assert hold[3] == 1 and all(hold[22:43]) and hold[45:53] == [0] * 8 and hold[53:55] == [1, 1]
+    twin = make_schedule(RunConfig(schedule="probe_P10_L2_o3+flip_s5_l2", **base))
+    assert [b for b, (a, t) in enumerate(zip(probe, twin)) if a != t] == [5, 6]
+    # New fields at their defaults leave the hash unchanged (xp1/xp2 configs stay valid).
+    cfg = RunConfig(**base)
+    assert cfg.hash() == RunConfig(**base, burst=None, always_measure_backdoor=False).hash()
+    assert cfg.hash() != RunConfig(**base, always_measure_backdoor=True).hash()
+
+
+def test_backdoor_measured_in_no_attack_runs_when_asked():
+    on = simulate(RunConfig(attack="none", defense="Krum", seed=0, always_measure_backdoor=True, **SHORT))
+    off = simulate(RunConfig(attack="none", defense="Krum", seed=0, **SHORT))
+    assert on.y_atk.notna().all() and on.y_atk.max() < 0.5  # base rate, no backdoor
+    assert off.y_atk.isna().all()
+    assert (on.poison_frac == 1.0).all()
+
+
 def test_no_attack_uses_all_workers_honestly():
     """attack=none with f=3: the 3 'Byzantine' workers are honest, so it equals an f=3 run whose window never opens."""
     a = simulate(RunConfig(attack="none", defense="Krum", seed=2, **SHORT))

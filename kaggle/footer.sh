@@ -50,6 +50,13 @@ run_xp2() {
   echo "== saved $(dirname "$WORK")/results_xp2.zip"
 }
 
+run_xp3() {
+  echo "== xp3: stealthy windowed backdoors (1/8, 2/8, 8/8) + no attack, probe schedules, 80 paired twins (400 runs)"
+  "$PY" -u run_experiment.py xp3 --jobs "$JOBS" $EXTRA
+  (cd "$WORK" && zip -qr "$WORK/../results_xp3.zip" runs_xp3)
+  echo "== saved $(dirname "$WORK")/results_xp3.zip"
+}
+
 SECONDS=0
 case "$STAGE" in
   sanity)         run_sanity ;;
@@ -57,5 +64,6 @@ case "$STAGE" in
   all)            run_sanity; run_collect ;;
   counterfactual) run_counterfactual ;;
   xp2)            run_xp2 ;;
+  xp3)            run_xp3 ;;
 esac
 echo "== done in $((SECONDS / 60)) min"

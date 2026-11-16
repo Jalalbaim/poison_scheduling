@@ -8,6 +8,7 @@
 #     !bash run_kaggle.sh all        # both, in sequence
 #     !bash run_kaggle.sh counterfactual   # GRU check 3: 384 runs, test seeds x candidate schedules
 #     !bash run_kaggle.sh xp2              # xp2: 260 runs, windowed backdoor + Krum, data with kills
+#     !bash run_kaggle.sh xp3              # xp3: 400 runs, stealthy backdoors, probes, paired twins
 #
 # Optional environment variables:
 #     JOBS=4          parallel runs (default: number of CPUs)
@@ -22,7 +23,7 @@
 set -euo pipefail
 
 STAGE="${1:-sanity}"
-case "$STAGE" in sanity|collect|all|counterfactual|xp2) ;; *) echo "usage: $0 [sanity|collect|all|counterfactual|xp2]"; exit 2;; esac
+case "$STAGE" in sanity|collect|all|counterfactual|xp2|xp3) ;; *) echo "usage: $0 [sanity|collect|all|counterfactual|xp2|xp3]"; exit 2;; esac
 if [ -d /kaggle/working ]; then DEFAULT_WORK=/kaggle/working/testbed; else DEFAULT_WORK="$PWD/testbed"; fi
 WORK="${WORK:-$DEFAULT_WORK}"
 JOBS="${JOBS:-$(nproc)}"

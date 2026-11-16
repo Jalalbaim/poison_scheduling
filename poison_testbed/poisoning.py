@@ -51,16 +51,30 @@ class AttackSpec:
     attack_kwargs: dict[str, Any] = field(default_factory=dict)
     window: tuple[int, int] | None = None  # inclusive block range; None = always
     has_trigger: bool = False  # y_atk defined
+    burst: tuple[int, int] | None = None  # (period, on): inside the window, active `on` blocks of every `period`
 
     def active(self, block: int) -> bool:
         if self.kind == "none":
             return False
-        return self.window is None or self.window[0] <= block <= self.window[1]
+        if self.window is not None and not self.window[0] <= block <= self.window[1]:
+            return False
+        if self.burst is not None:
+            period, on = self.burst
+            start = self.window[0] if self.window is not None else 0
+            return (block - start) % period < on
+        return True
 
 
 def make_attack(name: str, *, sign_flip_scale: float = 1.0, alie_z: float | str = "max",
-                window: tuple[int, int] = (15, 30)) -> AttackSpec:
-    """Build the named condition. Hyperparameters of the corruptions live in the run config."""
+                window: tuple[int, int] = (15, 30), burst: tuple[int, int] | None = None) -> AttackSpec:
+    """Build the named condition. Hyperparameters of the corruptions live in the run config.
+
+    ``backdoor_burst``: the backdoor, active inside ``window`` only during bursts (``burst`` = (period, on)).
+    """
+    if name == "backdoor_burst":
+        if burst is None:
+            raise ValueError("backdoor_burst needs burst=(period, on)")
+        return AttackSpec("backdoor_burst", "data", corrupt=backdoor, has_trigger=True, window=window, burst=burst)
     specs = {
         "none": AttackSpec("none", "none"),
         "label_flip": AttackSpec("label_flip", "data", corrupt=label_flip),
