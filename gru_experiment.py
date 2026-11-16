@@ -64,7 +64,9 @@ def assign_splits(df: pd.DataFrame) -> pd.Series:
     for stratification only, never as a model input.
     """
     split = pd.Series(index=df.index, dtype=object)
-    for _, g in df.groupby("attack"):
+    # xp3 logs the poison rate: stratify by it too, so every rate is in every split (xp1/xp2: attack only).
+    keys = ["attack", "poison_frac"] if "poison_frac" in df else ["attack"]
+    for _, g in df.groupby(keys):
         rank = {s: k for k, s in enumerate(sorted(g.seed.unique()))}
         r = g.seed.map(rank) % 20
         split[g.index] = np.where(r < 14, "train", np.where(r < 16, "val", "test"))
