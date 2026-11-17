@@ -260,6 +260,118 @@ def xp4_configs(overrides: dict) -> list[RunConfig]:
     return main + paired_twins(main, 71_000, XP4_TWINS)
 
 
+# xp5: Fashion-MNIST, several attack families, three defenses, one mixed GRU tested on held-out configurations.
+XP5_MAIN, XP5_TWINS, XP5_HELDOUT = 480, 48, 72
+XP5_SEED0, XP5_HELDOUT_SEED0 = 30_000, 31_000
+XP5_DEFENSES = ["Krum", "Median", "TrimmedMean"]
+XP5_FAMILIES = {"none": 0.20, "backdoor": 0.35, "burst": 0.15, "flip": 0.15, "alie": 0.15}
+XP5_TRIGGERS = ["corner", "patch_r3_c5"]  # seen; "blend" is held out
+XP5_TARGETS = [0, 3, 7]  # T-shirt, dress, sneaker
+XP5_FLIP_SOURCES = [1, 8]  # trouser, bag
+XP5_BURSTS = [(10, 5), (6, 3), (20, 5)]
+# Held-out configurations (never in training): an unseen trigger, an unseen poison rate, an unseen attack x defense.
+XP5_HELDOUT_GROUPS = ["blend trigger", "poison rate 3/8", "flip x TrimmedMean"]
+
+
+def xp5_schedule(rng: np.random.Generator) -> str:
+    family = rng.choice(list(XP4_FAMILIES), p=list(XP4_FAMILIES.values()))
+    if family == "sticky":
+        return f"sticky_p{rng.choice(XP3_STICKY_P)}"
+    if family == "react":
+        return f"react_d{rng.choice(XP4_REACT_DELAY)}_e{rng.choice(XP3_EXTRA)}"
+    if family in ("probe", "probehold"):
+        period, length = int(rng.choice(XP3_PROBE_PERIOD)), int(rng.choice(XP3_PROBE_LEN))
+        length = min(length, period - 1)
+        sched = f"probe_P{period}_L{length}_o{int(rng.integers(0, period))}"
+        if family == "probehold":
+            sched = (f"probehold_P{period}_L{length}_o{int(rng.integers(0, period))}"
+                     f"_d{rng.choice(XP4_REACT_DELAY)}_e{rng.choice(XP3_EXTRA)}")
+        return sched
+    return str(family)
+
+
+def xp5_params(overrides: dict) -> dict:
+    return {"C": XP1_C, "sigma": DEFAULT_SIGMA, "block_len": XP2_BLOCK_LEN, "n_blocks": XP2_BLOCKS,
+            "always_measure_backdoor": True, "signals": "v2", "dataset": "fmnist", "extended_log": True, **overrides}
+
+
+def _xp5_window(rng: np.random.Generator) -> tuple[int, int]:
+    start = int(rng.integers(2, 21)) if rng.random() < 0.3 else int(rng.integers(21, 151))
+    return start, start + int(rng.integers(30, 81)) - 1
+
+
+def xp5_main_config(i: int, overrides: dict) -> RunConfig:
+    """Seen configurations: every family x every defense, except the held-out ones (flip x TrimmedMean)."""
+    rng = np.random.default_rng(80_000 + i)
+    family = rng.choice(list(XP5_FAMILIES), p=list(XP5_FAMILIES.values()))
+    defense = str(rng.choice(XP5_DEFENSES))
+    target = int(rng.choice(XP5_TARGETS))
+    window = _xp5_window(rng)
+    fields: dict = {"target": target}
+    if family == "none":
+        fields.update(attack="none", trigger=str(rng.choice(XP5_TRIGGERS)))  # trigger: base-rate measurement only
+    elif family == "backdoor":
+        fields.update(attack="backdoor_win", trigger=str(rng.choice(XP5_TRIGGERS)),
+                      poison_frac=float(rng.choice([0.125, 0.25, 1.0])))
+    elif family == "burst":
+        fields.update(attack="backdoor_burst", trigger=str(rng.choice(XP5_TRIGGERS)),
+                      poison_frac=float(rng.choice([0.25, 1.0])),
+                      burst=tuple(int(v) for v in XP5_BURSTS[int(rng.integers(len(XP5_BURSTS)))]))
+    elif family == "flip":
+        defense = str(rng.choice(["Krum", "Median"]))  # flip x TrimmedMean is held out
+        fields.update(attack="flip_win", poison_frac=float(rng.choice([0.25, 1.0])),
+                      flip_source=int(rng.choice(XP5_FLIP_SOURCES)))
+    else:
+        fields.update(attack="alie_win")
+    return RunConfig(defense=defense, seed=XP5_SEED0 + i, schedule=xp5_schedule(rng), window=window,
+                     **fields, **xp5_params(overrides))
+
+
+def xp5_heldout_config(j: int, overrides: dict) -> RunConfig:
+    rng = np.random.default_rng(82_000 + j)
+    group = XP5_HELDOUT_GROUPS[j % len(XP5_HELDOUT_GROUPS)]
+    defense = str(rng.choice(XP5_DEFENSES))
+    target = int(rng.choice(XP5_TARGETS))
+    window = _xp5_window(rng)
+    if group == "blend trigger":
+        fields = dict(attack="backdoor_win", trigger="blend", poison_frac=float(rng.choice([0.25, 1.0])))
+    elif group == "poison rate 3/8":
+        fields = dict(attack="backdoor_win", trigger=str(rng.choice(XP5_TRIGGERS)), poison_frac=0.375)
+    else:
+        defense = "TrimmedMean"
+        fields = dict(attack="flip_win", poison_frac=float(rng.choice([0.25, 1.0])),
+                      flip_source=int(rng.choice(XP5_FLIP_SOURCES)))
+    return RunConfig(defense=defense, seed=XP5_HELDOUT_SEED0 + j, schedule=xp5_schedule(rng), window=window,
+                     target=target, **fields, **xp5_params(overrides))
+
+
+def xp5_heldout_group(attack: str, trigger: str, poison_frac: float, defense: str) -> str:
+    """Evaluation label of a run: 'seen' or the held-out group it belongs to (from its configuration)."""
+    if trigger == "blend":
+        return "blend trigger"
+    if abs(poison_frac - 0.375) < 1e-9:
+        return "poison rate 3/8"
+    if attack == "flip_win" and defense == "TrimmedMean":
+        return "flip x TrimmedMean"
+    return "seen"
+
+
+def xp5_configs(overrides: dict) -> list[RunConfig]:
+    """480 main runs + 48 paired twins (seen) + 72 held-out runs = 600."""
+    main = [xp5_main_config(i, overrides) for i in range(XP5_MAIN)]
+    heldout = [xp5_heldout_config(j, overrides) for j in range(XP5_HELDOUT)]
+    return main + paired_twins(main, 81_000, XP5_TWINS) + heldout
+
+
+def cmd_xp5(args: argparse.Namespace) -> None:
+    """xp5 data: Fashion-MNIST, backdoor variants / bursts / targeted flip / ALIE, Krum / Median / TrimmedMean."""
+    configs = xp5_configs(parse_overrides(args.set))
+    if args.seeds:  # smoke tests: a spread of runs (every k-th), so every family and the held-out set appear
+        step = max(1, len(configs) // args.seeds)
+        configs = configs[::step][: args.seeds]
+    execute(configs, ROOT / (args.out or "runs_xp5"), args.jobs)
+
+
 def cmd_xp4(args: argparse.Namespace) -> None:
     """xp4: xp3's design with the v2 signals (tail, scale-free, cross-round memory), onset-focused schedules."""
     configs = xp4_configs(parse_overrides(args.set))
@@ -320,7 +432,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = parser.add_subparsers(dest="cmd", required=True)
     for name, fn in [("calibrate", cmd_calibrate), ("sanity", cmd_sanity), ("collect", cmd_collect),
-                     ("counterfactual", cmd_counterfactual), ("xp2", cmd_xp2), ("xp3", cmd_xp3), ("xp4", cmd_xp4),
+                     ("counterfactual", cmd_counterfactual), ("xp2", cmd_xp2), ("xp3", cmd_xp3), ("xp4", cmd_xp4), ("xp5", cmd_xp5),
                      ("report", cmd_report)]:
         sp = sub.add_parser(name)
         sp.set_defaults(fn=fn)

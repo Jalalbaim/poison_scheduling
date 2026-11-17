@@ -281,6 +281,9 @@ def simulate(cfg: RunConfig, policy: Policy | None = None) -> pd.DataFrame:
     sim = build(cfg)
     base = {"run_id": cfg.run_id, "seed": cfg.seed, "schedule_seed": cfg.sched_seed, "defense": cfg.defense,
             "attack": cfg.attack, "poison_frac": cfg.poison_frac, "n": cfg.n, "f": cfg.f}
+    if cfg.extended_log:  # attack configuration as evaluation labels (u_: hidden from any policy)
+        base.update({"u_trigger": cfg.trigger, "u_target": cfg.target, "u_flip_source": cfg.flip_source,
+                     "u_burst": "" if cfg.burst is None else f"{cfg.burst[0]}_{cfg.burst[1]}"})
     rows = [{**base, "block": -1, "round_start": pd.NA, "lr": sim._current_lr, "W": pd.NA,
              **{c: math.nan for c in X_COLUMNS}, **_outcomes(sim, cfg), "u_active": 0, "u_type": "none"}]
     extra_cols: list[str] = []
@@ -308,7 +311,8 @@ def simulate(cfg: RunConfig, policy: Policy | None = None) -> pd.DataFrame:
                      "u_active": int(active), "u_type": cfg.attack if active else "none", **extra})
     x2 = list(X2_COLUMNS) if cfg.signals == "v2" else []
     if cfg.extended_log:
-        x2 += ["y_bd", "y_flip"] + [c for c in rows[-1] if c[-3:-1] == "_r" and c.startswith("x")]
+        x2 += ["y_bd", "y_flip", "u_trigger", "u_target", "u_flip_source", "u_burst"]
+        x2 += [c for c in rows[-1] if c[-3:-1] == "_r" and c.startswith("x")]
     df = pd.DataFrame(rows, columns=COLUMNS + x2 + extra_cols)
     return df.astype({"round_start": "Int64", "W": "Int64"})
 

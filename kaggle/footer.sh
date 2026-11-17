@@ -72,6 +72,62 @@ run_xp5_pilot() {
   echo "== saved $(dirname "$WORK")/xp5_pilot.zip"
 }
 
+xp5_zip() {  # (re)write the final zip with everything produced so far
+  (cd "$WORK" && rm -f "$WORK/../xp5_all.zip" && zip -qr "$WORK/../xp5_all.zip" \
+     $(ls -d results/xp5 results/deploy_xp5 results/pilot_xp5 xp5_logs 2>/dev/null))
+  echo "== saved $(dirname "$WORK")/xp5_all.zip"
+}
+
+run_xp5_data() {
+  if [ "${XP5_SMOKE:-0}" = "1" ]; then SMOKE_DATA=(--seeds 40 --set n_blocks=30); else SMOKE_DATA=(); fi
+  echo "== xp5 step 1: data (480 seen + 48 twins + 72 held-out runs; Fashion-MNIST; Krum / Median / TrimmedMean)"
+  "$PY" -u run_experiment.py xp5 --jobs "$JOBS" "${SMOKE_DATA[@]}" $EXTRA
+  (cd "$WORK" && rm -f "$WORK/../results_xp5_data.zip" && zip -qr "$WORK/../results_xp5_data.zip" runs_xp5)
+  echo "== saved $(dirname "$WORK")/results_xp5_data.zip  (attach it as a dataset for: run_kaggle.sh xp5_final)"
+}
+
+find_xp5_data() {
+  if [ -n "${XP5_DATA:-}" ]; then echo "$XP5_DATA"; return; fi
+  local f
+  f=$(find /kaggle/input -path '*runs_xp5/all_blocks.csv' 2>/dev/null | head -1)
+  if [ -z "$f" ]; then
+    local z; z=$(find /kaggle/input -name 'results_xp5_data*.zip' 2>/dev/null | head -1)
+    if [ -n "$z" ]; then unzip -qo "$z" 'runs_xp5/all_blocks.csv' -d "$WORK/xp5_unzipped" && f="$WORK/xp5_unzipped/runs_xp5/all_blocks.csv"; fi
+  fi
+  echo "$f"
+}
+
+run_xp5_final() {
+  local data; data=$(find_xp5_data)
+  if [ -z "$data" ] || [ ! -f "$data" ]; then
+    echo "xp5 data not found: attach results_xp5_data.zip as a dataset (Add Input) or set XP5_DATA=/path/all_blocks.csv"; exit 1
+  fi
+  local smoke="${XP5_SMOKE:-0}"
+  mkdir -p results/xp5/runs_xp5 xp5_logs
+  cp "$data" results/xp5/runs_xp5/all_blocks.csv
+  "$PY" - "$smoke" <<'PYCHECK'
+import sys
+import pandas as pd
+d = pd.read_csv("results/xp5/runs_xp5/all_blocks.csv")
+n, rows = d.run_id.nunique(), sorted(d.groupby("run_id").size().unique())
+print(f"xp5 data: {n} runs, rows per run {rows}")
+if sys.argv[1] != "1" and (n != 600 or rows != [251]):
+    raise SystemExit("unexpected xp5 data: expected 600 runs x 251 rows")
+PYCHECK
+  echo "== xp5 step 2a: one GRU trained on the mix of all seen configurations (3 candidates, selected on validation)"
+  local ep=(); [ "$smoke" = "1" ] && ep=(--epochs 2)
+  "$PY" -u gru_xp5.py --runs results/xp5/runs_xp5/all_blocks.csv --out results/xp5/gru "${ep[@]}" | tee xp5_logs/gru.txt
+  xp5_zip
+  echo "== xp5 step 2b: deployment (10 environments incl. 3 held-out x 3 seeds x 7 policies)"
+  local dsm=(); [ "$smoke" = "1" ] && dsm=(--smoke)
+  "$PY" -u deploy_xp5.py --jobs "$JOBS" "${dsm[@]}" | tee xp5_logs/deploy.txt
+  xp5_zip
+  echo "== xp5 step 2c: pilot (damage grid + erasure windows, 162 runs)"
+  local psm=(); [ "$smoke" = "1" ] && psm=(--limit 3)
+  "$PY" -u pilot_xp5.py --jobs "$JOBS" "${psm[@]}" | tee xp5_logs/pilot.txt
+  xp5_zip
+}
+
 # GRU candidates for xp3: name hidden lr weight_decay. xp1/xp2 settings (64, 2e-3, 0) overfit xp3 after 2 epochs.
 XP3_SWEEP=("a 64 5e-4 0" "b 32 5e-4 1e-3" "c 64 2e-4 1e-2" "d 128 5e-4 1e-2")
 
@@ -133,6 +189,8 @@ case "$STAGE" in
   xp3)            run_xp3 ;;
   xp4)            run_xp4 ;;
   xp5_pilot)      run_xp5_pilot ;;
+  xp5_data)       run_xp5_data ;;
+  xp5_final)      run_xp5_final ;;
   xp3_deploy)     run_xp3_deploy ;;
 esac
 echo "== done in $((SECONDS / 60)) min"

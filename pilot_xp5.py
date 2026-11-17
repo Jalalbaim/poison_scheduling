@@ -126,6 +126,9 @@ def report() -> None:
     print(t[cols].unstack("schedule").round(3).to_string())
 
     eb = b[b.part == "B"].copy()
+    if eb.empty:
+        print("\n## Part B: no erasure runs yet")
+        return
     eb["delay"] = eb.run_id.str.extract(r"react_d(\d+)_e0")[0].astype(int)
     eb["pf"] = eb.name.str.replace("erasure ", "").astype(float)
     fin = eb[eb.block == eb.block.max()].pivot_table(index=["defense", "pf"], columns="delay", values="y_atk").round(3)

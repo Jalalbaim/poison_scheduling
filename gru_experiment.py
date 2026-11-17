@@ -66,10 +66,21 @@ def assign_splits(df: pd.DataFrame) -> pd.Series:
     split = pd.Series(index=df.index, dtype=object)
     # xp3 logs the poison rate: stratify by it too, so every rate is in every split (xp1/xp2: attack only).
     keys = ["attack", "poison_frac"] if "poison_frac" in df else ["attack"]
+    # xp5 mixes defenses per run: stratify by defense too (xp1: every (attack, defense) has seeds 0-19 -> same split).
+    mixed = df.defense.nunique() > 1
+    if mixed:
+        keys.append("defense")
     for _, g in df.groupby(keys):
-        rank = {s: k for k, s in enumerate(sorted(g.seed.unique()))}
-        r = g.seed.map(rank) % 20
-        split[g.index] = np.where(r < 14, "train", np.where(r < 16, "val", "test"))
+        seeds = sorted(g.seed.unique())
+        rank = {s: k for k, s in enumerate(seeds)}
+        if mixed:
+            # Relative rank: every group, however small, spreads over train / val / test (xp5 has many small groups).
+            # xp1 (20 seeds per group): rank/20 < 0.7 <=> rank < 14, < 0.8 <=> rank < 16 -> the same split as before.
+            q = g.seed.map(rank) / len(seeds)
+            split[g.index] = np.where(q < 0.7, "train", np.where(q < 0.8, "val", "test"))
+        else:
+            r = g.seed.map(rank) % 20
+            split[g.index] = np.where(r < 14, "train", np.where(r < 16, "val", "test"))
     return split
 
 
@@ -384,7 +395,7 @@ def check_kill(model: OutcomeGRU, data: Data, device, out: Path) -> pd.DataFrame
         return pd.DataFrame()
     rows = []
     for r in range(len(data.seed)):
-        if data.attack[r] != "backdoor_win" or data.Ymask[r, :, 1].sum() == 0:
+        if data.attack[r] not in ("backdoor_win", "backdoor_burst", "flip_win") or data.Ymask[r, :, 1].sum() == 0:
             continue
         active = np.flatnonzero(data.U[r] > 0)  # rows (block + 1)
         if len(active) == 0:

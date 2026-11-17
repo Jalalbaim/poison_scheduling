@@ -56,6 +56,8 @@ def gains(model: OutcomeGRU, data: Data, device) -> pd.DataFrame:
         rows.append(pd.DataFrame({"run": data.run_ids[r], "attack": data.attack[r], "block": cuts,
                                   "gain": s[:, 1] - s[:, 0], "active": data.U[r, cuts] > 0,
                                   "atk_probe": p[:, 0, 1], "atk_defend": p[:, 1, 1]}))
+    if not rows:  # no eligible cut (e.g. very short runs): an empty table with the usual columns
+        return pd.DataFrame(columns=["run", "attack", "block", "gain", "active", "atk_probe", "atk_defend"])
     return pd.concat(rows, ignore_index=True)
 
 

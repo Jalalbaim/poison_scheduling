@@ -12,6 +12,10 @@
 #     !bash run_kaggle.sh xp4              # xp4: 400 runs, xp3 design + signals v2 (memory/tail signals), onset-focused
 #     !bash run_kaggle.sh xp5_pilot        # xp5 pilot: Fashion-MNIST, 8 attacks x Krum/Median/TrimmedMean (162 runs)
 #                                          #   -> /kaggle/working/xp5_pilot.zip
+#     !bash run_kaggle.sh xp5_data         # xp5 step 1: 600 runs (Fashion-MNIST, 5 attack families x 3 defenses)
+#                                          #   -> /kaggle/working/results_xp5_data.zip   (~6.5 h)
+#     !bash run_kaggle.sh xp5_final        # xp5 step 2: single mixed GRU + deployment + pilot -> xp5_all.zip
+#                                          #   needs results_xp5_data.zip attached as a dataset (Add Input) (~5.5 h)
 #     !bash run_kaggle.sh xp3_deploy       # GRU sweep on xp3 + model selection + deployment (96 runs)
 #                                          #   needs results_xp3.zip attached as a Kaggle dataset (Add Input)
 #                                          #   -> /kaggle/working/xp3_deploy.zip
@@ -21,6 +25,8 @@
 #     WORK=/path      output folder (default: /kaggle/working/testbed)
 #     EXTRA="--set sigma=0.02 --set sign_flip_scale=5"   config overrides for sanity/collect
 #     XP3_DATA=/path/all_blocks.csv   xp3 data for xp3_deploy (default: searched in /kaggle/input)
+#     XP5_DATA=/path/all_blocks.csv   xp5 data for xp5_final (default: searched in /kaggle/input)
+#     XP5_SMOKE=1     tiny version of the xp5 stages (30-block runs, 2 epochs): checks the pipeline end to end
 #
 # Re-running a stage skips runs that already finished with the same config,
 # so an interrupted stage can simply be started again (same session).
@@ -30,12 +36,14 @@
 set -euo pipefail
 
 STAGE="${1:-sanity}"
-case "$STAGE" in sanity|collect|all|counterfactual|xp2|xp3|xp4|xp5_pilot|xp3_deploy) ;; *) echo "usage: $0 [sanity|collect|all|counterfactual|xp2|xp3|xp4|xp5_pilot|xp3_deploy]"; exit 2;; esac
+case "$STAGE" in sanity|collect|all|counterfactual|xp2|xp3|xp4|xp5_pilot|xp5_data|xp5_final|xp3_deploy) ;; *) echo "usage: $0 [sanity|collect|all|counterfactual|xp2|xp3|xp4|xp5_pilot|xp5_data|xp5_final|xp3_deploy]"; exit 2;; esac
 if [ -d /kaggle/working ]; then DEFAULT_WORK=/kaggle/working/testbed; else DEFAULT_WORK="$PWD/testbed"; fi
 WORK="${WORK:-$DEFAULT_WORK}"
 JOBS="${JOBS:-$(nproc)}"
 EXTRA="${EXTRA:-}"
 VENV="$WORK/.venv"
+# Kaggle notebooks export MPLBACKEND=module://matplotlib_inline...; that backend is not in our venv.
+export MPLBACKEND=Agg
 PY="$VENV/bin/python"
 
 echo "== stage=$STAGE  work=$WORK  jobs=$JOBS  extra='$EXTRA'"
