@@ -10,6 +10,8 @@
 #     !bash run_kaggle.sh xp2              # xp2: 260 runs, windowed backdoor + Krum, data with kills
 #     !bash run_kaggle.sh xp3              # xp3: 400 runs, stealthy backdoors, probes, paired twins
 #     !bash run_kaggle.sh xp4              # xp4: 400 runs, xp3 design + signals v2 (memory/tail signals), onset-focused
+#     !bash run_kaggle.sh xp5_pilot        # xp5 pilot: Fashion-MNIST, 8 attacks x Krum/Median/TrimmedMean (162 runs)
+#                                          #   -> /kaggle/working/xp5_pilot.zip
 #     !bash run_kaggle.sh xp3_deploy       # GRU sweep on xp3 + model selection + deployment (96 runs)
 #                                          #   needs results_xp3.zip attached as a Kaggle dataset (Add Input)
 #                                          #   -> /kaggle/working/xp3_deploy.zip
@@ -28,7 +30,7 @@
 set -euo pipefail
 
 STAGE="${1:-sanity}"
-case "$STAGE" in sanity|collect|all|counterfactual|xp2|xp3|xp4|xp3_deploy) ;; *) echo "usage: $0 [sanity|collect|all|counterfactual|xp2|xp3|xp4|xp3_deploy]"; exit 2;; esac
+case "$STAGE" in sanity|collect|all|counterfactual|xp2|xp3|xp4|xp5_pilot|xp3_deploy) ;; *) echo "usage: $0 [sanity|collect|all|counterfactual|xp2|xp3|xp4|xp5_pilot|xp3_deploy]"; exit 2;; esac
 if [ -d /kaggle/working ]; then DEFAULT_WORK=/kaggle/working/testbed; else DEFAULT_WORK="$PWD/testbed"; fi
 WORK="${WORK:-$DEFAULT_WORK}"
 JOBS="${JOBS:-$(nproc)}"
@@ -233,6 +235,87 @@ def load_mnist(device: str, patch_size: int, target: int) -> Mnist:
         test=(xt.to(dev), yt.to(dev)),
         triggered=(apply_patch(xt[keep], patch_size).to(dev), yt[keep].to(dev)),
     )
+
+
+# ----------------------------------------------------------------------------- xp5: datasets and triggers
+# Normalisation per dataset (train-set pixel mean / std). MNIST keeps the constants above, so load_mnist is unchanged.
+NORM = {"mnist": (MEAN, STD), "fmnist": (0.2860, 0.3530)}
+BLEND_ALPHA = 0.2
+
+
+@dataclass(frozen=True)
+class Data:
+    train: TensorDataset
+    val: tuple[torch.Tensor, torch.Tensor]
+    test: tuple[torch.Tensor, torch.Tensor]
+    triggered: tuple[torch.Tensor, torch.Tensor]  # test images with true label != target, with the run's trigger
+    flip_source: tuple[torch.Tensor, torch.Tensor]  # test images of class flip_source (label flip success)
+    flip_pool: torch.Tensor  # training images of class flip_source (CPU): what a label-flip attacker feeds in
+
+
+def _tensors_of(dataset: str, train: bool) -> tuple[torch.Tensor, torch.Tensor]:
+    cls = {"mnist": datasets.MNIST, "fmnist": datasets.FashionMNIST}[dataset]
+    mean, std = NORM[dataset]
+    ds = cls(str(DATA_ROOT), train=train, download=True)
+    return (ds.data.float().div(255.0).sub(mean).div(std)).unsqueeze(1), ds.targets.clone().long()
+
+
+def _checkerboard() -> torch.Tensor:
+    """Fixed blend pattern in pixel space: 2x2-pixel checkerboard of 0 / 1, shape (28, 28)."""
+    i = torch.arange(28)
+    return (((i[:, None] // 2) + (i[None, :] // 2)) % 2).float()
+
+
+def make_trigger(dataset: str, trigger: str, patch_size: int):
+    """Return stamp(x) -> triggered copy of x (B,1,28,28), normalised with the dataset's statistics.
+
+    "corner"           white patch_size x patch_size square, bottom-right (as in xp1-xp4)
+    "patch_r{r}_c{c}"  the same white square with its top-left pixel at (r, c)
+    "blend"            x_pixel -> (1 - BLEND_ALPHA) x_pixel + BLEND_ALPHA * checkerboard (whole image)
+    """
+    mean, std = NORM[dataset]
+    white = (1.0 - mean) / std
+    if trigger == "corner":
+        def stamp(x):
+            x = x.clone()
+            x[..., -patch_size - 1: -1, -patch_size - 1: -1] = white
+            return x
+        return stamp
+    if trigger.startswith("patch_r"):
+        r, c = (int(v) for v in trigger[len("patch_r"):].split("_c"))
+
+        def stamp(x):
+            x = x.clone()
+            x[..., r: r + patch_size, c: c + patch_size] = white
+            return x
+        return stamp
+    if trigger == "blend":
+        pattern = (_checkerboard() - mean) / std
+
+        def stamp(x):
+            return (1 - BLEND_ALPHA) * x + BLEND_ALPHA * pattern.to(x.device)
+        return stamp
+    raise ValueError(f"unknown trigger {trigger!r}")
+
+
+@lru_cache(maxsize=8)
+def load_data(dataset: str, device: str, trigger: str, patch_size: int, target: int, flip_source: int) -> Data:
+    x, y = _tensors_of(dataset, train=True)
+    perm = torch.randperm(len(y), generator=torch.Generator().manual_seed(SPLIT_SEED))
+    val_idx, train_idx = perm[:VAL_SIZE], perm[VAL_SIZE:]
+    xt, yt = _tensors_of(dataset, train=False)
+    keep = yt != target
+    src = yt == flip_source
+    stamp = make_trigger(dataset, trigger, patch_size)
+    dev = torch.device(device)
+    return Data(
+        train=TensorDataset(x[train_idx], y[train_idx]),
+        val=(x[val_idx].to(dev), y[val_idx].to(dev)),
+        test=(xt.to(dev), yt.to(dev)),
+        triggered=(stamp(xt[keep]).to(dev), yt[keep].to(dev)),
+        flip_source=(xt[src].to(dev), yt[src].to(dev)),
+        flip_pool=x[train_idx][y[train_idx] == flip_source],
+    )
 __KRUM_TESTBED_EOF__
 cat > poison_testbed/poisoning.py <<'__KRUM_TESTBED_EOF__'
 """Attack conditions: data-poisoning corruptions and library gradient attacks, with an optional block window.
@@ -270,11 +353,28 @@ def label_flip(x: torch.Tensor, y: torch.Tensor, *, poison_frac: float, num_clas
     return x, y
 
 
-def backdoor(x: torch.Tensor, y: torch.Tensor, *, poison_frac: float, patch_size: int, target: int, **_: Any) -> Batch:
-    """Stamp the patch and set label ``target`` on the first ``poison_frac`` of the micro-batch."""
+def backdoor(x: torch.Tensor, y: torch.Tensor, *, poison_frac: float, patch_size: int, target: int,
+             stamp: Callable[[torch.Tensor], torch.Tensor] | None = None, **_: Any) -> Batch:
+    """Stamp the trigger and set label ``target`` on the first ``poison_frac`` of the micro-batch.
+
+    ``stamp`` (xp5) applies the run's trigger; None = the MNIST corner patch of xp1-xp4 (unchanged).
+    """
     k = _n_poisoned(len(y), poison_frac)
     x, y = x.clone(), y.clone()
-    x[:k] = apply_patch(x[:k], patch_size)
+    x[:k] = apply_patch(x[:k], patch_size) if stamp is None else stamp(x[:k])
+    y[:k] = target
+    return x, y
+
+
+def targeted_flip(x: torch.Tensor, y: torch.Tensor, *, poison_frac: float, target: int, flip_pool: torch.Tensor,
+                  flip_gen: torch.Generator, **_: Any) -> Batch:
+    """Targeted label flip: the first ``poison_frac`` of the micro-batch is replaced by training images of the
+    source class (drawn from ``flip_pool`` with the attacker's own generator, so the honest data stream is
+    unchanged), all labelled ``target``. The attacker controls the content of its micro-batch."""
+    k = _n_poisoned(len(y), poison_frac)
+    x, y = x.clone(), y.clone()
+    idx = torch.randint(len(flip_pool), (k,), generator=flip_gen)
+    x[:k] = flip_pool[idx].to(x.device)
     y[:k] = target
     return x, y
 
@@ -287,7 +387,8 @@ class AttackSpec:
     attack_cls: type[Attack] | None = None
     attack_kwargs: dict[str, Any] = field(default_factory=dict)
     window: tuple[int, int] | None = None  # inclusive block range; None = always
-    has_trigger: bool = False  # y_atk defined
+    has_trigger: bool = False  # y_atk = backdoor success
+    outcome: str = ""  # xp5: "backdoor" | "flip" | "none" (no targeted harm: y_atk masked); "" = has_trigger rule
     burst: tuple[int, int] | None = None  # (period, on): inside the window, active `on` blocks of every `period`
 
     def active(self, block: int) -> bool:
@@ -318,6 +419,10 @@ def make_attack(name: str, *, sign_flip_scale: float = 1.0, alie_z: float | str 
         "backdoor": AttackSpec("backdoor", "data", corrupt=backdoor, has_trigger=True),
         "backdoor_win": AttackSpec("backdoor_win", "data", corrupt=backdoor, has_trigger=True, window=window),
         "alie": AttackSpec("alie", "gradient", attack_cls=ALIEAttack, attack_kwargs={"z": alie_z}),
+        # xp5: windowed targeted label flip and windowed ALIE
+        "flip_win": AttackSpec("flip_win", "data", corrupt=targeted_flip, window=window, outcome="flip"),
+        "alie_win": AttackSpec("alie_win", "gradient", attack_cls=ALIEAttack, attack_kwargs={"z": alie_z},
+                               window=window, outcome="none"),
         "sign_flip": AttackSpec("sign_flip", "gradient", attack_cls=SignFlipAttack,
                                 attack_kwargs={"scale": sign_flip_scale}),
     }
@@ -352,7 +457,7 @@ from krum.primitives.aggregators.trimmed_mean import TrimmedMean
 from krum.primitives.models.mlp import Krum2017MLPMnist
 
 from .aggregators import ClipNoise
-from .data import load_mnist
+from .data import load_data, load_mnist, make_trigger
 from .poisoning import make_attack
 from .signals import X2_COLUMNS, X_COLUMNS
 from .simulation import PoisoningSimulation
@@ -410,6 +515,13 @@ class RunConfig:
     # Signal set: "v1" = the 7 X columns of xp1-xp3; "v2" adds the X2 columns (tail, scale-free, memory; xp4).
     # v2 changes no computation of the run itself: v1 columns, outcomes and training are identical.
     signals: str = "v1"
+    # xp5 (defaults = xp1-xp4 behaviour): dataset, backdoor trigger, source class of the targeted label flip
+    # (images of flip_source relabelled `target`), and extended logging (per-round signal values r0/r1 and both
+    # targeted outcomes y_bd / y_flip in every run).
+    dataset: str = "mnist"
+    trigger: str = "corner"
+    flip_source: int = 1
+    extended_log: bool = False
     device: str = field(default_factory=lambda: "cuda" if torch.cuda.is_available() else "cpu")
 
     @property
@@ -431,7 +543,19 @@ class RunConfig:
         return hashlib.sha256(payload.encode()).hexdigest()[:16]
 
 
-LATER_FIELDS = {"burst": None, "always_measure_backdoor": False, "signals": "v1"}
+LATER_FIELDS = {"burst": None, "always_measure_backdoor": False, "signals": "v1", "dataset": "mnist",
+                "trigger": "corner", "flip_source": 1, "extended_log": False}
+
+
+def is_legacy_data(cfg: "RunConfig") -> bool:
+    """MNIST with the corner patch: the xp1-xp4 data path (load_mnist, apply_patch), kept bit-identical."""
+    return cfg.dataset == "mnist" and cfg.trigger == "corner"
+
+
+def load_run_data(cfg: "RunConfig"):
+    if is_legacy_data(cfg) and not cfg.extended_log:
+        return load_mnist(cfg.device, cfg.patch_size, cfg.target)
+    return load_data(cfg.dataset, cfg.device, cfg.trigger, cfg.patch_size, cfg.target, cfg.flip_source)
 
 CF_SCHEDULE = re.compile(r"cf_(on|off|ontil20|offtil20|alt)_p(\d+)")
 PROBE_SCHEDULE = re.compile(r"probe_P(\d+)_L(\d+)_o(\d+)")
@@ -520,12 +644,15 @@ def defense_kwargs(cfg: RunConfig) -> dict[str, Any]:
 
 def build(cfg: RunConfig) -> PoisoningSimulation:
     torch.use_deterministic_algorithms(True)
-    data = load_mnist(cfg.device, cfg.patch_size, cfg.target)
+    data = load_run_data(cfg)
     spec = make_attack(cfg.attack, sign_flip_scale=cfg.sign_flip_scale, alie_z=cfg.alie_z, window=cfg.window,
                        burst=cfg.burst)
     sim = PoisoningSimulation(
         attack_spec=spec,
-        corrupt_kwargs={"poison_frac": cfg.poison_frac, "patch_size": cfg.patch_size, "target": cfg.target},
+        corrupt_kwargs={"poison_frac": cfg.poison_frac, "patch_size": cfg.patch_size, "target": cfg.target,
+                        **({"flip_pool": data.flip_pool, "flip_gen": torch.Generator().manual_seed(cfg.seed + 30_000)}
+                           if cfg.attack == "flip_win" else {}),
+                        **({} if is_legacy_data(cfg) else {"stamp": make_trigger(cfg.dataset, cfg.trigger, cfg.patch_size)})},
         plain=Average,
         defense=DEFENSES[cfg.defense],
         defense_kwargs=defense_kwargs(cfg),
@@ -549,12 +676,22 @@ def build(cfg: RunConfig) -> PoisoningSimulation:
 
 
 def _outcomes(sim: PoisoningSimulation, cfg: RunConfig) -> dict[str, float]:
-    data = load_mnist(cfg.device, cfg.patch_size, cfg.target)
+    data = load_run_data(cfg)
     val_acc, _ = sim.accuracy_loss(*data.val)
     acc, loss = sim.accuracy_loss(*data.test)
-    measure = sim.attack_spec.has_trigger or cfg.always_measure_backdoor
-    y_atk = sim.target_rate(data.triggered[0], cfg.target) if measure else math.nan
-    return {"x_val_acc": val_acc, "y_clean_acc": acc, "y_clean_loss": loss, "y_atk": y_atk}
+    spec = sim.attack_spec
+    out = {"x_val_acc": val_acc, "y_clean_acc": acc, "y_clean_loss": loss}
+    if spec.outcome == "flip":  # targeted label flip: share of flip_source test images predicted as the target
+        out["y_atk"] = sim.target_rate(data.flip_source[0], cfg.target)
+    elif spec.outcome == "none":  # no targeted harm (ALIE): masked; its harm is in y_clean_acc
+        out["y_atk"] = math.nan
+    else:  # xp1-xp4 rule: backdoor success when the attack has a trigger (or when asked, e.g. no-attack runs)
+        measure = spec.has_trigger or cfg.always_measure_backdoor
+        out["y_atk"] = sim.target_rate(data.triggered[0], cfg.target) if measure else math.nan
+    if cfg.extended_log:  # both targeted outcomes in every run, whatever the attack
+        out["y_bd"] = sim.target_rate(data.triggered[0], cfg.target)
+        out["y_flip"] = sim.target_rate(data.flip_source[0], cfg.target)
+    return out
 
 
 HIDDEN_FROM_POLICY = ("y_", "u_", "attack")
@@ -594,11 +731,17 @@ def simulate(cfg: RunConfig, policy: Policy | None = None) -> pd.DataFrame:
                 if c.startswith("x2_"):
                     x_block[f"{c}_mean"] = sum(r[c] for r in per_round) / len(per_round)
                     x_block[f"{c}_max"] = max(r[c] for r in per_round)
+        if cfg.extended_log:  # the value of every signal in each round of the block
+            for k, r in enumerate(per_round):
+                for c, v in r.items():
+                    x_block[f"{c}_r{k}"] = v
         active = sim.attack_spec.active(b)
         rows.append({**base, "block": b, "round_start": b * cfg.block_len, "lr": lr, "W": sim.schedule[b],
                      **x_block, **_outcomes(sim, cfg),
                      "u_active": int(active), "u_type": cfg.attack if active else "none", **extra})
     x2 = list(X2_COLUMNS) if cfg.signals == "v2" else []
+    if cfg.extended_log:
+        x2 += ["y_bd", "y_flip"] + [c for c in rows[-1] if c[-3:-1] == "_r" and c.startswith("x")]
     df = pd.DataFrame(rows, columns=COLUMNS + x2 + extra_cols)
     return df.astype({"round_start": "Int64", "W": "Int64"})
 
@@ -1433,6 +1576,24 @@ def test_v2_signals_change_nothing_else():
     assert all(a[c].equals(b[c]) for c in a.columns)  # same training, same v1 signals, same outcomes
     x2 = b[list(X2_COLUMNS)]
     assert x2.iloc[0].isna().all() and x2.iloc[1:].notna().all().all()
+
+
+def test_xp5_attacks_and_outcomes():
+    common = dict(defense="Krum", seed=4, schedule="off", window=(1, 2), always_measure_backdoor=True,
+                  dataset="fmnist", extended_log=True, **SHORT)
+    legacy = RunConfig(attack="none", defense="Krum", seed=4, **SHORT)
+    assert legacy.hash() == RunConfig(attack="none", defense="Krum", seed=4, dataset="mnist", trigger="corner",
+                                      flip_source=1, extended_log=False, **SHORT).hash()
+    alie = simulate(RunConfig(attack="alie_win", **common))
+    assert alie.y_atk.iloc[1:].isna().all() and alie.y_bd.iloc[1:].notna().all()  # ALIE: no targeted outcome
+    flip = simulate(RunConfig(attack="flip_win", poison_frac=1.0, **common))
+    assert flip.y_atk.iloc[1:].equals(flip.y_flip.iloc[1:])
+    blend = simulate(RunConfig(attack="backdoor_win", poison_frac=0.25, trigger="blend", **common))
+    assert blend.y_atk.iloc[1:].equals(blend.y_bd.iloc[1:])
+    assert {"x_norm_std_r0", "x_norm_std_r1"} <= set(blend.columns)
+    # the attack never shifts the honest data stream: identical signals before the window
+    none = simulate(RunConfig(attack="none", **common))
+    assert none.x_norm_std.iloc[1] == flip.x_norm_std.iloc[1]
 __KRUM_TESTBED_EOF__
 cat > analyze.py <<'__KRUM_TESTBED_EOF__'
 """Step 4: causal analysis of the randomized-defense logs.
@@ -1921,6 +2082,10 @@ def assign_splits(df: pd.DataFrame) -> pd.Series:
     return split
 
 
+def x_columns(df: pd.DataFrame) -> list[str]:
+    return list(X_COLS) + [c for c in df.columns if c.startswith("x2_")]
+
+
 def horizons(n_blocks: int) -> list[int]:
     return [1, 5, n_blocks // 5, n_blocks // 2]  # xp1: 1, 5, 10, 25
 
@@ -1929,7 +2094,10 @@ def horizons(n_blocks: int) -> list[int]:
 class Data:
     """Per-run tensors. Row i is block i-1 (row 0 = initial state); n_rows = n_blocks + 1."""
 
-    def __init__(self, df: pd.DataFrame, x_mean: np.ndarray | None = None, x_std: np.ndarray | None = None):
+    def __init__(self, df: pd.DataFrame, x_mean: np.ndarray | None = None, x_std: np.ndarray | None = None,
+                 x_cols: list[str] | None = None):
+        # Inputs: the v1 signals, plus the v2 signals when the data has them (xp4). xp1-xp3 are unchanged.
+        self.x_cols = x_cols if x_cols is not None else x_columns(df)
         df = df.sort_values(["run_id", "block"])
         runs = df.groupby("run_id", sort=True)
         sizes = runs.size()
@@ -1942,11 +2110,13 @@ class Data:
         self.defense = meta.defense.to_numpy()
         R, n = len(meta), int(sizes.iloc[0])
         self.n_rows, self.n_blocks = n, n - 1
-        X = df[X_COLS].to_numpy(float).reshape(R, n, len(X_COLS))
+        X = df[self.x_cols].to_numpy(float).reshape(R, n, len(self.x_cols))
         if x_mean is None:
             x_mean, x_std = np.nanmean(X[:, 1:], axis=(0, 1)), np.nanstd(X[:, 1:], axis=(0, 1))
         self.x_mean, self.x_std = x_mean, x_std
         X = np.nan_to_num((X - x_mean) / x_std)  # row 0 (init) -> 0, flagged below
+        if len(self.x_cols) > len(X_COLS):
+            X = np.clip(X, -10, 10)  # v2 ratio signals are heavy-tailed (xp4 only; v1 data is left as before)
         W = np.nan_to_num(df.W.to_numpy(float).reshape(R, n))
         t = np.broadcast_to((np.arange(n) - 1) / self.n_blocks, (R, n))
         init = np.zeros((R, n)); init[:, 0] = 1
@@ -2414,7 +2584,7 @@ cat > check_probe.py <<'__KRUM_TESTBED_EOF__'
 
 For every xp3 run of a split and every block b whose previous block was defended (a probe or a hold), the
 controller of deploy_xp3 compares two plans for blocks b..b+H-1: keep probing (one defended block every P) or
-defend every block. Gain = score(defend) - score(probe), score = clean - LAMBDA * backdoor at block b+H-1.
+defend every block (--alt release: or not defend at all; --cuts all: from every block). Gain = score(defend) - score(alt), score = clean - LAMBDA * backdoor at block b+H-1.
 Label (evaluation only, from u_active): the attack is active in block b-1. A good model has gain > 0 when an
 attack is active and gain < 0 when none is: reported as AUC, and as TPR / FPR of the rule gain > 0.
 
@@ -2438,6 +2608,8 @@ from gru_experiment import Data, OutcomeGRU, assign_splits
 
 RUNS = Path("results/xp3/runs_xp3/all_blocks.csv")
 SELECTED = Path("results/xp3/gru_selected.json")
+ALT = "probe"  # alternative plan to "defend": "probe" (xp3: keep probing) or "release" (xp4: defend no more)
+CUTS = "defended"  # "defended": blocks after a defended block; "all": every block (xp4 gru_free)
 
 
 @torch.no_grad()
@@ -2446,12 +2618,13 @@ def gains(model: OutcomeGRU, data: Data, device) -> pd.DataFrame:
     rows, H, nb = [], HORIZON, data.n_blocks
     h_all = model.encode(data.enc.to(device))  # (R, rows, hidden): h_all[r, b] = state after blocks -1..b-1
     for r in range(len(data.seed)):
-        cuts = np.array([b for b in range(1, nb - H + 1) if data.W[r, b] == 1])  # block b-1 defended
+        cuts = np.array([b for b in range(1, nb - H + 1) if CUTS == "all" or data.W[r, b] == 1])
         if not len(cuts):
             continue
         W = np.zeros((2 * len(cuts), data.n_rows))
         for k, b in enumerate(cuts):
-            W[2 * k, b + 1: b + 1 + H] = [int(j % PROBE_PERIOD == 0) for j in range(b, b + H)]  # keep probing
+            if ALT == "probe":
+                W[2 * k, b + 1: b + 1 + H] = [int(j % PROBE_PERIOD == 0) for j in range(b, b + H)]  # keep probing
             W[2 * k + 1, b + 1: b + 1 + H] = 1                                                # defend
         dec = data.dec_inputs(W, runs=slice(r, r + 1))  # (2C, n_rows-1, F); index i = row i+1 = block i
         idx = np.repeat(cuts, 2)[:, None] + np.arange(H)[None, :]  # blocks b..b+H-1
@@ -2486,10 +2659,18 @@ def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("models", nargs="+", type=Path)
     ap.add_argument("--select", action="store_true")
+    ap.add_argument("--runs", type=Path, default=RUNS)
+    ap.add_argument("--alt", choices=["probe", "release"], default="probe")
+    ap.add_argument("--cuts", choices=["defended", "all"], default="defended")
+    ap.add_argument("--out", type=Path, default=None, help="selection json (default results/xp3/gru_selected.json)")
     args = ap.parse_args()
+    global ALT, CUTS
+    ALT, CUTS = args.alt, args.cuts
+    selected = args.out or SELECTED
+    tag = f"{args.alt}_{args.cuts}"
     sys.stdout.reconfigure(encoding="utf-8")
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    df = analyze.load(RUNS)
+    df = analyze.load(args.runs)
     split = assign_splits(df)
     train = Data(df[split == "train"])
     sets = {name: Data(df[split == name], train.x_mean, train.x_std) for name in ("val", "test")}
@@ -2499,7 +2680,7 @@ def main() -> None:
         model, res = load_model(folder, train, device)
         for name in ("val",) if args.select else ("val", "test"):
             t = gains(model, sets[name], device)
-            t.to_csv(folder / f"checkP_{name}.csv", index=False)
+            t.to_csv(folder / f"checkP_{tag}_{name}.csv", index=False)
             res[name] = score(t)
         out[str(folder)] = res
         print(folder, json.dumps(res), flush=True)
@@ -2507,13 +2688,14 @@ def main() -> None:
         best = max(out, key=lambda k: (out[k]["val"]["auc"], -out[k]["val"]["fpr"]))
         model, _ = load_model(Path(best), train, device)
         t = gains(model, sets["test"], device)
-        t.to_csv(Path(best) / "checkP_test.csv", index=False)
+        t.to_csv(Path(best) / f"checkP_{tag}_test.csv", index=False)
         out[best]["test"] = score(t)
         verdict = "ok" if out[best]["val"]["auc"] >= 0.7 else "WEAK: validation AUC < 0.7, deployment is unlikely to help"
-        SELECTED.write_text(json.dumps({"selected": best, "verdict": verdict, "models": out}, indent=2))
+        selected.write_text(json.dumps({"selected": best, "verdict": verdict, "alt": ALT, "cuts": CUTS,
+                                        "models": out}, indent=2))
         print(f"\nselected {best}: val {out[best]['val']}, test {out[best]['test']} -> {verdict}", flush=True)
     else:
-        Path("results/xp3/checkP_models.json").write_text(json.dumps(out, indent=2))
+        (args.out or Path("results/xp3/checkP_models.json")).write_text(json.dumps(out, indent=2))
 
 
 if __name__ == "__main__":
@@ -2891,6 +3073,189 @@ def main() -> None:
 if __name__ == "__main__":
     main()
 __KRUM_TESTBED_EOF__
+cat > pilot_xp5.py <<'__KRUM_TESTBED_EOF__'
+"""Pilot for xp5 (Fashion-MNIST, several attack families, Krum / Median / TrimmedMean). Runs on Kaggle.
+
+    python pilot_xp5.py --jobs 4          # runs + report -> results/pilot_xp5
+    python pilot_xp5.py --report-only
+
+Part A, damage grid: every attack x every defense x {always off, always on} x 2 seeds. Attack window: blocks
+30-89 (60 blocks of 2 rounds), 250 blocks. Answers: does each attack do damage on Fashion-MNIST, does each defense
+stop it, and what does each defense cost in clean accuracy?
+    ALIE has no targeted outcome: its harm is the clean-accuracy gap to the no-attack run of the same seed and
+    schedule (the goal is to reach no-attack performance).
+Part B, erasure windows: backdoor (corner patch) at 1/8, 2/8, 8/8 with each defense switched on d blocks after the
+attack starts (d = 0, 2, 5, 10, 20, 40) and kept on to the end of the window; 1 seed. Sets the reaction delays of
+the xp5 schedules, per defense.
+"""
+
+import argparse
+import json
+import sys
+import time
+from concurrent.futures import ProcessPoolExecutor, as_completed
+from multiprocessing import get_context
+from pathlib import Path
+
+import matplotlib
+
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt  # noqa: E402
+import numpy as np  # noqa: E402
+import pandas as pd  # noqa: E402
+import torch  # noqa: E402
+
+import poison_testbed  # noqa: E402,F401  (CUBLAS_WORKSPACE_CONFIG)
+from analyze import INK, INK2, SERIES  # noqa: E402
+from poison_testbed.runner import RunConfig, simulate  # noqa: E402
+
+ROOT = Path(__file__).resolve().parent
+OUT = ROOT / "results/pilot_xp5"
+XP1_C, SIGMA, BLOCK_LEN, N_BLOCKS, WINDOW = 3.0552712798118593, 0.01, 2, 250, (30, 89)
+DEFENSES = ["Krum", "Median", "TrimmedMean"]
+# name -> RunConfig fields
+ATTACKS = {
+    "none": dict(attack="none"),
+    "backdoor corner 2/8": dict(attack="backdoor_win", poison_frac=0.25),
+    "backdoor corner 8/8": dict(attack="backdoor_win", poison_frac=1.0),
+    "backdoor patch_r3_c5 2/8": dict(attack="backdoor_win", poison_frac=0.25, trigger="patch_r3_c5"),
+    "backdoor blend 2/8": dict(attack="backdoor_win", poison_frac=0.25, trigger="blend"),
+    "burst corner 8/8 (5 of 10)": dict(attack="backdoor_burst", poison_frac=1.0, burst=(10, 5)),
+    "flip 2/8": dict(attack="flip_win", poison_frac=0.25),
+    "flip 8/8": dict(attack="flip_win", poison_frac=1.0),
+    "alie": dict(attack="alie_win"),
+}
+SEEDS_A = [7000, 7001]
+ERASURE_RATES, ERASURE_DELAYS, SEED_B = [0.125, 0.25, 1.0], [0, 2, 5, 10, 20, 40], 7100
+
+
+def config(fields: dict, defense: str, schedule: str, seed: int) -> RunConfig:
+    return RunConfig(defense=defense, seed=seed, C=XP1_C, sigma=SIGMA, schedule=schedule, block_len=BLOCK_LEN,
+                     n_blocks=N_BLOCKS, window=WINDOW, always_measure_backdoor=True, signals="v2",
+                     dataset="fmnist", extended_log=True, **fields)
+
+
+def jobs() -> list[tuple[str, str, dict, str, str, int]]:
+    out = []
+    for name, fields in ATTACKS.items():
+        for d in DEFENSES:
+            for sch in ["off", "on"]:
+                for s in SEEDS_A:
+                    out.append(("A", name, fields, d, sch, s))
+    for pf in ERASURE_RATES:
+        for d in DEFENSES:
+            for delay in ERASURE_DELAYS:
+                out.append(("B", f"erasure {pf}", dict(attack="backdoor_win", poison_frac=pf), d,
+                            f"react_d{delay}_e0", SEED_B))
+    return out
+
+
+def run_one(part: str, name: str, fields: dict, defense: str, schedule: str, seed: int) -> tuple[str, float]:
+    cfg = config(fields, defense, schedule, seed)
+    run_id = f"{part}__{name.replace('/', 'of').replace(' ', '_')}__{defense}__{schedule}__s{seed}"
+    out = OUT / "runs" / run_id
+    if (out / "blocks.csv").exists():
+        return run_id, json.loads((out / "config.json").read_text())["wall_clock_s"]
+    started = time.time()
+    df = simulate(cfg).copy()
+    wall = time.time() - started
+    df.insert(0, "part", part)
+    df.insert(1, "name", name)
+    df["run_id"] = run_id
+    out.mkdir(parents=True, exist_ok=True)
+    df.to_csv(out / "blocks.csv", index=False)
+    (out / "config.json").write_text(json.dumps({
+        "run_id": run_id, "config": cfg.__dict__, "config_hash": cfg.hash(), "wall_clock_s": round(wall, 1),
+        "device_name": torch.cuda.get_device_name(0) if cfg.device == "cuda" else cfg.device}, indent=2, default=str))
+    return run_id, wall
+
+
+def report() -> None:
+    b = pd.concat([pd.read_csv(f) for f in sorted((OUT / "runs").glob("*/blocks.csv"))], ignore_index=True)
+    b = b[b.block >= 0]
+    b.to_csv(OUT / "blocks_all.csv", index=False)
+    pd.set_option("display.width", 250)
+    pd.set_option("display.max_columns", 40)
+    s, e = WINDOW
+    a = b[b.part == "A"].copy()
+    a["schedule"] = a.run_id.str.extract(r"__(on|off)__s")[0]
+    rows = []
+    for (name, d, sch, seed), g in a.groupby(["name", "defense", "schedule", "seed"]):
+        g = g.sort_values("block")
+        win = g[(g.block >= s) & (g.block <= e)]
+        rows.append({"attack": name, "defense": d, "schedule": sch, "seed": seed,
+                     "final_clean": g.y_clean_acc.iloc[-1], "clean_at_window_end": g.y_clean_acc.iloc[e],
+                     "mean_clean_in_window": win.y_clean_acc.mean(),
+                     "atk_peak": g.y_atk.max(), "atk_mean_in_window": win.y_atk.mean(), "atk_final": g.y_atk.iloc[-1]})
+    r = pd.DataFrame(rows)
+    none = r[r.attack == "none"].set_index(["defense", "schedule", "seed"])
+    key = list(zip(r.defense, r.schedule, r.seed))
+    r["clean_gap_vs_no_attack_final"] = r.final_clean.to_numpy() - none.final_clean.reindex(key).to_numpy()
+    r["clean_gap_vs_no_attack_in_window"] = (r.mean_clean_in_window.to_numpy()
+                                             - none.mean_clean_in_window.reindex(key).to_numpy())
+    r.to_csv(OUT / "damage_runs.csv", index=False)
+    t = r.groupby(["attack", "defense", "schedule"]).mean(numeric_only=True).drop(columns="seed").round(3)
+    t.to_csv(OUT / "damage.csv")
+    print("## Part A: damage per attack x defense, always off vs always on (mean of 2 seeds)")
+    cols = ["atk_peak", "atk_mean_in_window", "atk_final", "final_clean", "clean_gap_vs_no_attack_in_window",
+            "clean_gap_vs_no_attack_final"]
+    print(t[cols].unstack("schedule").round(3).to_string())
+
+    eb = b[b.part == "B"].copy()
+    eb["delay"] = eb.run_id.str.extract(r"react_d(\d+)_e0")[0].astype(int)
+    eb["pf"] = eb.name.str.replace("erasure ", "").astype(float)
+    fin = eb[eb.block == eb.block.max()].pivot_table(index=["defense", "pf"], columns="delay", values="y_atk").round(3)
+    fin.to_csv(OUT / "erasure.csv")
+    print("\n## Part B: final backdoor success when the defense starts d blocks after the attack (corner patch)")
+    print(fin.to_string())
+    fig_erasure(fin)
+
+
+def fig_erasure(fin: pd.DataFrame) -> None:
+    fig, axes = plt.subplots(1, len(DEFENSES), figsize=(4.2 * len(DEFENSES), 3.6), sharey=True, squeeze=False)
+    colors = dict(zip(ERASURE_RATES, list(SERIES.values())[:3]))
+    for ax, d in zip(axes[0], DEFENSES):
+        if d not in fin.index.get_level_values(0):
+            continue
+        for pf in ERASURE_RATES:
+            if (d, pf) in fin.index:
+                v = fin.loc[(d, pf)]
+                ax.plot(v.index, v.values, marker="o", color=colors[pf], label=f"{int(pf * 8)}/8 poisoned")
+        ax.set_title(d, color=INK, loc="left")
+        ax.set_xlabel("blocks between attack start and defense (2 rounds each)")
+        ax.axhline(0.1, color=INK2, linewidth=0.8, linestyle=(0, (3, 2)))
+    axes[0, 0].set_ylabel("final backdoor success")
+    if axes[0, 0].get_legend_handles_labels()[0]:
+        axes[0, 0].legend(fontsize=8)
+    fig.suptitle("Fashion-MNIST erasure windows: how long can each defense wait and still erase the backdoor?",
+                 fontsize=10, color=INK, x=0.01, ha="left")
+    fig.tight_layout(rect=(0, 0, 1, 0.92))
+    fig.savefig(OUT / "erasure.png", dpi=130)
+    plt.close(fig)
+
+
+def main() -> None:
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--jobs", type=int, default=3)
+    ap.add_argument("--report-only", action="store_true")
+    ap.add_argument("--limit", type=int, help="first N jobs only (smoke test)")
+    args = ap.parse_args()
+    sys.stdout.reconfigure(encoding="utf-8")
+    OUT.mkdir(parents=True, exist_ok=True)
+    if not args.report_only:
+        todo = jobs()[: args.limit] if args.limit else jobs()
+        started = time.time()
+        with ProcessPoolExecutor(max_workers=args.jobs, mp_context=get_context("spawn")) as pool:
+            futs = [pool.submit(run_one, *j) for j in todo]
+            for k, fut in enumerate(as_completed(futs), 1):
+                run_id, wall = fut.result()
+                print(f"[{k}/{len(todo)}] {run_id}  {wall:.0f}s  (elapsed {time.time() - started:.0f}s)", flush=True)
+    report()
+
+
+if __name__ == "__main__":
+    main()
+__KRUM_TESTBED_EOF__
 
 # ---------------------------------------------------------------------------
 # 3. Tests (reproducibility, schedule dispatch, labels). Stops here on failure.
@@ -2957,6 +3322,14 @@ run_xp4() {
   echo "== saved $(dirname "$WORK")/results_xp4.zip"
 }
 
+run_xp5_pilot() {
+  echo "== xp5 pilot: Fashion-MNIST; damage grid (9 attack settings x 3 defenses x on/off x 2 seeds) + erasure windows (162 runs)"
+  "$PY" -u pilot_xp5.py --jobs "$JOBS" | tee pilot_xp5_log.txt
+  cp pilot_xp5_log.txt results/pilot_xp5/
+  (cd "$WORK" && zip -qr "$WORK/../xp5_pilot.zip" results/pilot_xp5)
+  echo "== saved $(dirname "$WORK")/xp5_pilot.zip"
+}
+
 # GRU candidates for xp3: name hidden lr weight_decay. xp1/xp2 settings (64, 2e-3, 0) overfit xp3 after 2 epochs.
 XP3_SWEEP=("a 64 5e-4 0" "b 32 5e-4 1e-3" "c 64 2e-4 1e-2" "d 128 5e-4 1e-2")
 
@@ -3017,6 +3390,7 @@ case "$STAGE" in
   xp2)            run_xp2 ;;
   xp3)            run_xp3 ;;
   xp4)            run_xp4 ;;
+  xp5_pilot)      run_xp5_pilot ;;
   xp3_deploy)     run_xp3_deploy ;;
 esac
 echo "== done in $((SECONDS / 60)) min"

@@ -64,6 +64,14 @@ run_xp4() {
   echo "== saved $(dirname "$WORK")/results_xp4.zip"
 }
 
+run_xp5_pilot() {
+  echo "== xp5 pilot: Fashion-MNIST; damage grid (9 attack settings x 3 defenses x on/off x 2 seeds) + erasure windows (162 runs)"
+  "$PY" -u pilot_xp5.py --jobs "$JOBS" | tee pilot_xp5_log.txt
+  cp pilot_xp5_log.txt results/pilot_xp5/
+  (cd "$WORK" && zip -qr "$WORK/../xp5_pilot.zip" results/pilot_xp5)
+  echo "== saved $(dirname "$WORK")/xp5_pilot.zip"
+}
+
 # GRU candidates for xp3: name hidden lr weight_decay. xp1/xp2 settings (64, 2e-3, 0) overfit xp3 after 2 epochs.
 XP3_SWEEP=("a 64 5e-4 0" "b 32 5e-4 1e-3" "c 64 2e-4 1e-2" "d 128 5e-4 1e-2")
 
@@ -124,6 +132,7 @@ case "$STAGE" in
   xp2)            run_xp2 ;;
   xp3)            run_xp3 ;;
   xp4)            run_xp4 ;;
+  xp5_pilot)      run_xp5_pilot ;;
   xp3_deploy)     run_xp3_deploy ;;
 esac
 echo "== done in $((SECONDS / 60)) min"

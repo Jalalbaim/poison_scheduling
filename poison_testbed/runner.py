@@ -24,7 +24,7 @@ from krum.primitives.aggregators.trimmed_mean import TrimmedMean
 from krum.primitives.models.mlp import Krum2017MLPMnist
 
 from .aggregators import ClipNoise
-from .data import load_mnist
+from .data import load_data, load_mnist, make_trigger
 from .poisoning import make_attack
 from .signals import X2_COLUMNS, X_COLUMNS
 from .simulation import PoisoningSimulation
@@ -82,6 +82,13 @@ class RunConfig:
     # Signal set: "v1" = the 7 X columns of xp1-xp3; "v2" adds the X2 columns (tail, scale-free, memory; xp4).
     # v2 changes no computation of the run itself: v1 columns, outcomes and training are identical.
     signals: str = "v1"
+    # xp5 (defaults = xp1-xp4 behaviour): dataset, backdoor trigger, source class of the targeted label flip
+    # (images of flip_source relabelled `target`), and extended logging (per-round signal values r0/r1 and both
+    # targeted outcomes y_bd / y_flip in every run).
+    dataset: str = "mnist"
+    trigger: str = "corner"
+    flip_source: int = 1
+    extended_log: bool = False
     device: str = field(default_factory=lambda: "cuda" if torch.cuda.is_available() else "cpu")
 
     @property
@@ -103,7 +110,19 @@ class RunConfig:
         return hashlib.sha256(payload.encode()).hexdigest()[:16]
 
 
-LATER_FIELDS = {"burst": None, "always_measure_backdoor": False, "signals": "v1"}
+LATER_FIELDS = {"burst": None, "always_measure_backdoor": False, "signals": "v1", "dataset": "mnist",
+                "trigger": "corner", "flip_source": 1, "extended_log": False}
+
+
+def is_legacy_data(cfg: "RunConfig") -> bool:
+    """MNIST with the corner patch: the xp1-xp4 data path (load_mnist, apply_patch), kept bit-identical."""
+    return cfg.dataset == "mnist" and cfg.trigger == "corner"
+
+
+def load_run_data(cfg: "RunConfig"):
+    if is_legacy_data(cfg) and not cfg.extended_log:
+        return load_mnist(cfg.device, cfg.patch_size, cfg.target)
+    return load_data(cfg.dataset, cfg.device, cfg.trigger, cfg.patch_size, cfg.target, cfg.flip_source)
 
 CF_SCHEDULE = re.compile(r"cf_(on|off|ontil20|offtil20|alt)_p(\d+)")
 PROBE_SCHEDULE = re.compile(r"probe_P(\d+)_L(\d+)_o(\d+)")
@@ -192,12 +211,15 @@ def defense_kwargs(cfg: RunConfig) -> dict[str, Any]:
 
 def build(cfg: RunConfig) -> PoisoningSimulation:
     torch.use_deterministic_algorithms(True)
-    data = load_mnist(cfg.device, cfg.patch_size, cfg.target)
+    data = load_run_data(cfg)
     spec = make_attack(cfg.attack, sign_flip_scale=cfg.sign_flip_scale, alie_z=cfg.alie_z, window=cfg.window,
                        burst=cfg.burst)
     sim = PoisoningSimulation(
         attack_spec=spec,
-        corrupt_kwargs={"poison_frac": cfg.poison_frac, "patch_size": cfg.patch_size, "target": cfg.target},
+        corrupt_kwargs={"poison_frac": cfg.poison_frac, "patch_size": cfg.patch_size, "target": cfg.target,
+                        **({"flip_pool": data.flip_pool, "flip_gen": torch.Generator().manual_seed(cfg.seed + 30_000)}
+                           if cfg.attack == "flip_win" else {}),
+                        **({} if is_legacy_data(cfg) else {"stamp": make_trigger(cfg.dataset, cfg.trigger, cfg.patch_size)})},
         plain=Average,
         defense=DEFENSES[cfg.defense],
         defense_kwargs=defense_kwargs(cfg),
@@ -221,12 +243,22 @@ def build(cfg: RunConfig) -> PoisoningSimulation:
 
 
 def _outcomes(sim: PoisoningSimulation, cfg: RunConfig) -> dict[str, float]:
-    data = load_mnist(cfg.device, cfg.patch_size, cfg.target)
+    data = load_run_data(cfg)
     val_acc, _ = sim.accuracy_loss(*data.val)
     acc, loss = sim.accuracy_loss(*data.test)
-    measure = sim.attack_spec.has_trigger or cfg.always_measure_backdoor
-    y_atk = sim.target_rate(data.triggered[0], cfg.target) if measure else math.nan
-    return {"x_val_acc": val_acc, "y_clean_acc": acc, "y_clean_loss": loss, "y_atk": y_atk}
+    spec = sim.attack_spec
+    out = {"x_val_acc": val_acc, "y_clean_acc": acc, "y_clean_loss": loss}
+    if spec.outcome == "flip":  # targeted label flip: share of flip_source test images predicted as the target
+        out["y_atk"] = sim.target_rate(data.flip_source[0], cfg.target)
+    elif spec.outcome == "none":  # no targeted harm (ALIE): masked; its harm is in y_clean_acc
+        out["y_atk"] = math.nan
+    else:  # xp1-xp4 rule: backdoor success when the attack has a trigger (or when asked, e.g. no-attack runs)
+        measure = spec.has_trigger or cfg.always_measure_backdoor
+        out["y_atk"] = sim.target_rate(data.triggered[0], cfg.target) if measure else math.nan
+    if cfg.extended_log:  # both targeted outcomes in every run, whatever the attack
+        out["y_bd"] = sim.target_rate(data.triggered[0], cfg.target)
+        out["y_flip"] = sim.target_rate(data.flip_source[0], cfg.target)
+    return out
 
 
 HIDDEN_FROM_POLICY = ("y_", "u_", "attack")
@@ -266,11 +298,17 @@ def simulate(cfg: RunConfig, policy: Policy | None = None) -> pd.DataFrame:
                 if c.startswith("x2_"):
                     x_block[f"{c}_mean"] = sum(r[c] for r in per_round) / len(per_round)
                     x_block[f"{c}_max"] = max(r[c] for r in per_round)
+        if cfg.extended_log:  # the value of every signal in each round of the block
+            for k, r in enumerate(per_round):
+                for c, v in r.items():
+                    x_block[f"{c}_r{k}"] = v
         active = sim.attack_spec.active(b)
         rows.append({**base, "block": b, "round_start": b * cfg.block_len, "lr": lr, "W": sim.schedule[b],
                      **x_block, **_outcomes(sim, cfg),
                      "u_active": int(active), "u_type": cfg.attack if active else "none", **extra})
     x2 = list(X2_COLUMNS) if cfg.signals == "v2" else []
+    if cfg.extended_log:
+        x2 += ["y_bd", "y_flip"] + [c for c in rows[-1] if c[-3:-1] == "_r" and c.startswith("x")]
     df = pd.DataFrame(rows, columns=COLUMNS + x2 + extra_cols)
     return df.astype({"round_start": "Int64", "W": "Int64"})
 

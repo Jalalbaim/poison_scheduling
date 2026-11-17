@@ -73,6 +73,10 @@ def assign_splits(df: pd.DataFrame) -> pd.Series:
     return split
 
 
+def x_columns(df: pd.DataFrame) -> list[str]:
+    return list(X_COLS) + [c for c in df.columns if c.startswith("x2_")]
+
+
 def horizons(n_blocks: int) -> list[int]:
     return [1, 5, n_blocks // 5, n_blocks // 2]  # xp1: 1, 5, 10, 25
 
@@ -81,7 +85,10 @@ def horizons(n_blocks: int) -> list[int]:
 class Data:
     """Per-run tensors. Row i is block i-1 (row 0 = initial state); n_rows = n_blocks + 1."""
 
-    def __init__(self, df: pd.DataFrame, x_mean: np.ndarray | None = None, x_std: np.ndarray | None = None):
+    def __init__(self, df: pd.DataFrame, x_mean: np.ndarray | None = None, x_std: np.ndarray | None = None,
+                 x_cols: list[str] | None = None):
+        # Inputs: the v1 signals, plus the v2 signals when the data has them (xp4). xp1-xp3 are unchanged.
+        self.x_cols = x_cols if x_cols is not None else x_columns(df)
         df = df.sort_values(["run_id", "block"])
         runs = df.groupby("run_id", sort=True)
         sizes = runs.size()
@@ -94,11 +101,13 @@ class Data:
         self.defense = meta.defense.to_numpy()
         R, n = len(meta), int(sizes.iloc[0])
         self.n_rows, self.n_blocks = n, n - 1
-        X = df[X_COLS].to_numpy(float).reshape(R, n, len(X_COLS))
+        X = df[self.x_cols].to_numpy(float).reshape(R, n, len(self.x_cols))
         if x_mean is None:
             x_mean, x_std = np.nanmean(X[:, 1:], axis=(0, 1)), np.nanstd(X[:, 1:], axis=(0, 1))
         self.x_mean, self.x_std = x_mean, x_std
         X = np.nan_to_num((X - x_mean) / x_std)  # row 0 (init) -> 0, flagged below
+        if len(self.x_cols) > len(X_COLS):
+            X = np.clip(X, -10, 10)  # v2 ratio signals are heavy-tailed (xp4 only; v1 data is left as before)
         W = np.nan_to_num(df.W.to_numpy(float).reshape(R, n))
         t = np.broadcast_to((np.arange(n) - 1) / self.n_blocks, (R, n))
         init = np.zeros((R, n)); init[:, 0] = 1

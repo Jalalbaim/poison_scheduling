@@ -5,7 +5,7 @@
 
 For every xp3 run of a split and every block b whose previous block was defended (a probe or a hold), the
 controller of deploy_xp3 compares two plans for blocks b..b+H-1: keep probing (one defended block every P) or
-defend every block. Gain = score(defend) - score(probe), score = clean - LAMBDA * backdoor at block b+H-1.
+defend every block (--alt release: or not defend at all; --cuts all: from every block). Gain = score(defend) - score(alt), score = clean - LAMBDA * backdoor at block b+H-1.
 Label (evaluation only, from u_active): the attack is active in block b-1. A good model has gain > 0 when an
 attack is active and gain < 0 when none is: reported as AUC, and as TPR / FPR of the rule gain > 0.
 
@@ -29,6 +29,8 @@ from gru_experiment import Data, OutcomeGRU, assign_splits
 
 RUNS = Path("results/xp3/runs_xp3/all_blocks.csv")
 SELECTED = Path("results/xp3/gru_selected.json")
+ALT = "probe"  # alternative plan to "defend": "probe" (xp3: keep probing) or "release" (xp4: defend no more)
+CUTS = "defended"  # "defended": blocks after a defended block; "all": every block (xp4 gru_free)
 
 
 @torch.no_grad()
@@ -37,12 +39,13 @@ def gains(model: OutcomeGRU, data: Data, device) -> pd.DataFrame:
     rows, H, nb = [], HORIZON, data.n_blocks
     h_all = model.encode(data.enc.to(device))  # (R, rows, hidden): h_all[r, b] = state after blocks -1..b-1
     for r in range(len(data.seed)):
-        cuts = np.array([b for b in range(1, nb - H + 1) if data.W[r, b] == 1])  # block b-1 defended
+        cuts = np.array([b for b in range(1, nb - H + 1) if CUTS == "all" or data.W[r, b] == 1])
         if not len(cuts):
             continue
         W = np.zeros((2 * len(cuts), data.n_rows))
         for k, b in enumerate(cuts):
-            W[2 * k, b + 1: b + 1 + H] = [int(j % PROBE_PERIOD == 0) for j in range(b, b + H)]  # keep probing
+            if ALT == "probe":
+                W[2 * k, b + 1: b + 1 + H] = [int(j % PROBE_PERIOD == 0) for j in range(b, b + H)]  # keep probing
             W[2 * k + 1, b + 1: b + 1 + H] = 1                                                # defend
         dec = data.dec_inputs(W, runs=slice(r, r + 1))  # (2C, n_rows-1, F); index i = row i+1 = block i
         idx = np.repeat(cuts, 2)[:, None] + np.arange(H)[None, :]  # blocks b..b+H-1
@@ -77,10 +80,18 @@ def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("models", nargs="+", type=Path)
     ap.add_argument("--select", action="store_true")
+    ap.add_argument("--runs", type=Path, default=RUNS)
+    ap.add_argument("--alt", choices=["probe", "release"], default="probe")
+    ap.add_argument("--cuts", choices=["defended", "all"], default="defended")
+    ap.add_argument("--out", type=Path, default=None, help="selection json (default results/xp3/gru_selected.json)")
     args = ap.parse_args()
+    global ALT, CUTS
+    ALT, CUTS = args.alt, args.cuts
+    selected = args.out or SELECTED
+    tag = f"{args.alt}_{args.cuts}"
     sys.stdout.reconfigure(encoding="utf-8")
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    df = analyze.load(RUNS)
+    df = analyze.load(args.runs)
     split = assign_splits(df)
     train = Data(df[split == "train"])
     sets = {name: Data(df[split == name], train.x_mean, train.x_std) for name in ("val", "test")}
@@ -90,7 +101,7 @@ def main() -> None:
         model, res = load_model(folder, train, device)
         for name in ("val",) if args.select else ("val", "test"):
             t = gains(model, sets[name], device)
-            t.to_csv(folder / f"checkP_{name}.csv", index=False)
+            t.to_csv(folder / f"checkP_{tag}_{name}.csv", index=False)
             res[name] = score(t)
         out[str(folder)] = res
         print(folder, json.dumps(res), flush=True)
@@ -98,13 +109,14 @@ def main() -> None:
         best = max(out, key=lambda k: (out[k]["val"]["auc"], -out[k]["val"]["fpr"]))
         model, _ = load_model(Path(best), train, device)
         t = gains(model, sets["test"], device)
-        t.to_csv(Path(best) / "checkP_test.csv", index=False)
+        t.to_csv(Path(best) / f"checkP_{tag}_test.csv", index=False)
         out[best]["test"] = score(t)
         verdict = "ok" if out[best]["val"]["auc"] >= 0.7 else "WEAK: validation AUC < 0.7, deployment is unlikely to help"
-        SELECTED.write_text(json.dumps({"selected": best, "verdict": verdict, "models": out}, indent=2))
+        selected.write_text(json.dumps({"selected": best, "verdict": verdict, "alt": ALT, "cuts": CUTS,
+                                        "models": out}, indent=2))
         print(f"\nselected {best}: val {out[best]['val']}, test {out[best]['test']} -> {verdict}", flush=True)
     else:
-        Path("results/xp3/checkP_models.json").write_text(json.dumps(out, indent=2))
+        (args.out or Path("results/xp3/checkP_models.json")).write_text(json.dumps(out, indent=2))
 
 
 if __name__ == "__main__":

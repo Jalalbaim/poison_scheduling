@@ -131,3 +131,21 @@ def test_v2_signals_change_nothing_else():
     assert all(a[c].equals(b[c]) for c in a.columns)  # same training, same v1 signals, same outcomes
     x2 = b[list(X2_COLUMNS)]
     assert x2.iloc[0].isna().all() and x2.iloc[1:].notna().all().all()
+
+
+def test_xp5_attacks_and_outcomes():
+    common = dict(defense="Krum", seed=4, schedule="off", window=(1, 2), always_measure_backdoor=True,
+                  dataset="fmnist", extended_log=True, **SHORT)
+    legacy = RunConfig(attack="none", defense="Krum", seed=4, **SHORT)
+    assert legacy.hash() == RunConfig(attack="none", defense="Krum", seed=4, dataset="mnist", trigger="corner",
+                                      flip_source=1, extended_log=False, **SHORT).hash()
+    alie = simulate(RunConfig(attack="alie_win", **common))
+    assert alie.y_atk.iloc[1:].isna().all() and alie.y_bd.iloc[1:].notna().all()  # ALIE: no targeted outcome
+    flip = simulate(RunConfig(attack="flip_win", poison_frac=1.0, **common))
+    assert flip.y_atk.iloc[1:].equals(flip.y_flip.iloc[1:])
+    blend = simulate(RunConfig(attack="backdoor_win", poison_frac=0.25, trigger="blend", **common))
+    assert blend.y_atk.iloc[1:].equals(blend.y_bd.iloc[1:])
+    assert {"x_norm_std_r0", "x_norm_std_r1"} <= set(blend.columns)
+    # the attack never shifts the honest data stream: identical signals before the window
+    none = simulate(RunConfig(attack="none", **common))
+    assert none.x_norm_std.iloc[1] == flip.x_norm_std.iloc[1]
