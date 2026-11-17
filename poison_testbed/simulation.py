@@ -27,7 +27,7 @@ from krum.simulations.centralised.krum_nips_2017 import KrumSimulation
 
 from .aggregators import ClipNoise, ScheduledAggregator
 from .poisoning import AttackSpec
-from .signals import round_signals
+from .signals import SignalTrackerV2, round_signals
 
 # Offsets that separate the seeded streams of one run.
 PERM_STREAM, NOISE_STREAM = 10_000, 20_000
@@ -45,6 +45,7 @@ class PoisoningSimulation(KrumSimulation):
         schedule: list[int],
         block_len: int,
         C_ref: float,
+        signals_v2: bool = False,
         **kwargs: Any,
     ) -> None:
         # The library's own aggregator/attack slots are left empty: this subclass's step() handles both.
@@ -57,6 +58,7 @@ class PoisoningSimulation(KrumSimulation):
         self.schedule = schedule
         self.block_len = block_len
         self.C_ref = C_ref
+        self.tracker = SignalTrackerV2(self.n, self.f) if signals_v2 else None
         if len(schedule) * block_len != self.rounds:
             raise ValueError(f"schedule covers {len(schedule) * block_len} rounds, expected {self.rounds}")
 
@@ -72,15 +74,22 @@ class PoisoningSimulation(KrumSimulation):
         self._perm_gen = torch.Generator(device=dev).manual_seed(self.seed + PERM_STREAM)
         self._noise_gen = torch.Generator(device=dev).manual_seed(self.seed + NOISE_STREAM)
 
-    def _grad_and_loss(self, x: torch.Tensor, y: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        """Same computation as the library's ``_train_one_worker``, also returning the loss."""
+    def _grad_and_loss(self, x: torch.Tensor, y: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Same computation as the library's ``_train_one_worker``, also returning the loss, and the per-sample
+        losses and labels when v2 signals are on (computed from the same logits, outside the autograd graph, so
+        the gradient is unchanged)."""
         assert self._model is not None
         self._model.module.train()
         x, y = x.to(self.device), y.to(self.device)
         self._model.module.zero_grad()
-        loss = self.loss_fn(self._model.module(x), y)
+        logits = self._model.module(x)
+        loss = self.loss_fn(logits, y)
         loss.backward()
-        return self._model.relink_gradients().clone(), loss.detach()
+        per_sample = None
+        if self.tracker is not None:
+            with torch.no_grad():
+                per_sample = torch.nn.functional.cross_entropy(logits.detach(), y, reduction="none")
+        return self._model.relink_gradients().clone(), loss.detach(), per_sample, y
 
     def step(self) -> dict[str, float]:
         if self._model is None:
@@ -93,6 +102,8 @@ class PoisoningSimulation(KrumSimulation):
 
         grads: list[torch.Tensor] = []
         losses: list[torch.Tensor] = []
+        sample_losses: list[torch.Tensor] = []
+        sample_labels: list[torch.Tensor] = []
         for w in range(self.n):
             x, y = next(iter(self._worker_loaders[w]))  # always drawn: keeps the data stream fixed
             byzantine = w >= n_honest and attacking
@@ -101,9 +112,12 @@ class PoisoningSimulation(KrumSimulation):
             if byzantine and spec.kind == "data":
                 assert spec.corrupt is not None
                 x, y = spec.corrupt(x, y, **self.corrupt_kwargs)
-            g, loss = self._grad_and_loss(x, y)
+            g, loss, per_sample, labels = self._grad_and_loss(x, y)
             grads.append(g)
             losses.append(loss)
+            if per_sample is not None:
+                sample_losses.append(per_sample)
+                sample_labels.append(labels)
 
         if attacking and spec.kind == "gradient":
             assert spec.attack_cls is not None
@@ -113,6 +127,11 @@ class PoisoningSimulation(KrumSimulation):
         perm = torch.randperm(self.n, generator=self._perm_gen, device=self.device)
         stacked = torch.stack(grads)[perm]
         x_round = round_signals(stacked, torch.stack(losses), self.C_ref)
+        if self.tracker is not None:
+            mb_losses = torch.stack(losses)
+            if len(mb_losses) == self.n:
+                mb_losses = mb_losses[perm]  # same order as the gradients
+            x_round.update(self.tracker(stacked, mb_losses, torch.cat(sample_losses), torch.cat(sample_labels)))
 
         noise = torch.randn(stacked.shape[1], generator=self._noise_gen, device=self.device, dtype=stacked.dtype)
         defense_kwargs = dict(self.defense_kwargs)

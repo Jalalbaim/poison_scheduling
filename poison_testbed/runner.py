@@ -26,7 +26,7 @@ from krum.primitives.models.mlp import Krum2017MLPMnist
 from .aggregators import ClipNoise
 from .data import load_mnist
 from .poisoning import make_attack
-from .signals import X_COLUMNS
+from .signals import X2_COLUMNS, X_COLUMNS
 from .simulation import PoisoningSimulation
 
 # Bump when a code change should invalidate cached runs.
@@ -79,6 +79,9 @@ class RunConfig:
     # Measure backdoor success (y_atk) even without a trigger attack, e.g. in no-attack runs (xp3). It then
     # reads as the base rate (~1%), which teaches a model that without an attack the backdoor stays at 0.
     always_measure_backdoor: bool = False
+    # Signal set: "v1" = the 7 X columns of xp1-xp3; "v2" adds the X2 columns (tail, scale-free, memory; xp4).
+    # v2 changes no computation of the run itself: v1 columns, outcomes and training are identical.
+    signals: str = "v1"
     device: str = field(default_factory=lambda: "cuda" if torch.cuda.is_available() else "cpu")
 
     @property
@@ -100,7 +103,7 @@ class RunConfig:
         return hashlib.sha256(payload.encode()).hexdigest()[:16]
 
 
-LATER_FIELDS = {"burst": None, "always_measure_backdoor": False}
+LATER_FIELDS = {"burst": None, "always_measure_backdoor": False, "signals": "v1"}
 
 CF_SCHEDULE = re.compile(r"cf_(on|off|ontil20|offtil20|alt)_p(\d+)")
 PROBE_SCHEDULE = re.compile(r"probe_P(\d+)_L(\d+)_o(\d+)")
@@ -201,6 +204,7 @@ def build(cfg: RunConfig) -> PoisoningSimulation:
         schedule=make_schedule(cfg),
         block_len=cfg.block_len,
         C_ref=cfg.C,
+        signals_v2=cfg.signals == "v2",
         model_cls=Krum2017MLPMnist,
         train_datasets=[data.train] * cfg.n,
         test_set=torch.utils.data.TensorDataset(*data.test),
@@ -257,11 +261,17 @@ def simulate(cfg: RunConfig, policy: Policy | None = None) -> pd.DataFrame:
         lr = sim._current_lr
         per_round = [sim.step() for _ in range(cfg.block_len)]
         x_block = {c: sum(r[c] for r in per_round) / len(per_round) for c in X_COLUMNS}
+        if cfg.signals == "v2":  # block mean and block max of every v2 signal
+            for c in per_round[0]:
+                if c.startswith("x2_"):
+                    x_block[f"{c}_mean"] = sum(r[c] for r in per_round) / len(per_round)
+                    x_block[f"{c}_max"] = max(r[c] for r in per_round)
         active = sim.attack_spec.active(b)
         rows.append({**base, "block": b, "round_start": b * cfg.block_len, "lr": lr, "W": sim.schedule[b],
                      **x_block, **_outcomes(sim, cfg),
                      "u_active": int(active), "u_type": cfg.attack if active else "none", **extra})
-    df = pd.DataFrame(rows, columns=COLUMNS + extra_cols)
+    x2 = list(X2_COLUMNS) if cfg.signals == "v2" else []
+    df = pd.DataFrame(rows, columns=COLUMNS + x2 + extra_cols)
     return df.astype({"round_start": "Int64", "W": "Int64"})
 
 

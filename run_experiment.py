@@ -178,39 +178,37 @@ XP3_PROBE_PERIOD = [3, 5, 10, 20]  # blocks between probes: from measure_erasure
 XP3_PROBE_LEN = [1, 2, 4]  # blocks per probe
 
 
-def xp3_main_config(i: int, overrides: dict) -> RunConfig:
-    """Main run i of xp3 (seed XP3_SEED0 + i): attack, window (real or phantom) and schedule drawn per run."""
-    rng = np.random.default_rng(30_000 + i)  # per-run stream
-    names = list(XP3_ATTACKS)
-    attack, pf, _ = XP3_ATTACKS[names[rng.choice(len(names), p=[v[2] for v in XP3_ATTACKS.values()])]]
+def windowed_config(i: int, overrides: dict, *, rng_seed: int, seed: int, attacks: dict, families: dict,
+                    react_delay: list, params: dict) -> RunConfig:
+    """One main run of xp3 / xp4: attack, window (real or phantom) and schedule drawn from a per-run stream."""
+    rng = np.random.default_rng(rng_seed)
+    names = list(attacks)
+    attack, pf, _ = attacks[names[rng.choice(len(names), p=[v[2] for v in attacks.values()])]]
     start = int(rng.integers(2, 21)) if rng.random() < 0.3 else int(rng.integers(21, 151))  # ~30% early
     window = (start, start + int(rng.integers(30, 81)) - 1)
-    family = rng.choice(list(XP3_FAMILIES), p=list(XP3_FAMILIES.values()))
+    family = rng.choice(list(families), p=list(families.values()))
     if family == "sticky":
         schedule = f"sticky_p{rng.choice(XP3_STICKY_P)}"
     elif family == "react":
-        schedule = f"react_d{rng.choice(XP3_REACT_DELAY)}_e{rng.choice(XP3_EXTRA)}"
+        schedule = f"react_d{rng.choice(react_delay)}_e{rng.choice(XP3_EXTRA)}"
     elif family in ("probe", "probehold"):
         period, length = int(rng.choice(XP3_PROBE_PERIOD)), int(rng.choice(XP3_PROBE_LEN))
         length = min(length, period - 1)
         schedule = f"probe_P{period}_L{length}_o{int(rng.integers(0, period))}"
         if family == "probehold":
             schedule = (f"probehold_P{period}_L{length}_o{int(rng.integers(0, period))}"
-                        f"_d{rng.choice(XP3_REACT_DELAY)}_e{rng.choice(XP3_EXTRA)}")
+                        f"_d{rng.choice(react_delay)}_e{rng.choice(XP3_EXTRA)}")
     else:
         schedule = str(family)
-    params = {"C": XP1_C, "sigma": DEFAULT_SIGMA, "block_len": XP2_BLOCK_LEN, "n_blocks": XP2_BLOCKS,
-              "always_measure_backdoor": True, **overrides}
-    return RunConfig(attack=attack, defense="Krum", seed=XP3_SEED0 + i, schedule=schedule, window=window,
-                     poison_frac=pf, **params)
+    return RunConfig(attack=attack, defense="Krum", seed=seed, schedule=schedule, window=window,
+                     poison_frac=pf, **{**params, **overrides})
 
 
-def xp3_configs(overrides: dict) -> list[RunConfig]:
-    """320 main runs + 80 paired twins. A twin = a main run with W flipped on 1-3 blocks (same seed, same data)."""
-    main = [xp3_main_config(i, overrides) for i in range(XP3_MAIN)]
-    rng = np.random.default_rng(31_000)
+def paired_twins(main: list[RunConfig], rng_seed: int, count: int) -> list[RunConfig]:
+    """Twins = main runs with W flipped on 1-3 blocks (same seed, same data): true short-term effects."""
+    rng = np.random.default_rng(rng_seed)
     twins = []
-    for i in sorted(rng.choice(XP3_MAIN, XP3_TWINS, replace=False)):
+    for i in sorted(rng.choice(len(main), count, replace=False)):
         base = main[i]
         if rng.random() < 0.5:  # around the attack start, where short changes matter most
             s = int(np.clip(base.window[0] + rng.integers(-5, 16), 0, XP2_BLOCKS - 1))
@@ -218,7 +216,56 @@ def xp3_configs(overrides: dict) -> list[RunConfig]:
             s = int(rng.integers(0, XP2_BLOCKS))
         ln = int(rng.integers(1, 4))
         twins.append(RunConfig(**{**base.__dict__, "schedule": f"{base.schedule}+flip_s{s}_l{min(ln, XP2_BLOCKS - s)}"}))
-    return main + twins
+    return twins
+
+
+def xp3_main_config(i: int, overrides: dict) -> RunConfig:
+    """Main run i of xp3 (seed XP3_SEED0 + i): attack, window (real or phantom) and schedule drawn per run."""
+    params = {"C": XP1_C, "sigma": DEFAULT_SIGMA, "block_len": XP2_BLOCK_LEN, "n_blocks": XP2_BLOCKS,
+              "always_measure_backdoor": True}
+    return windowed_config(i, overrides, rng_seed=30_000 + i, seed=XP3_SEED0 + i, attacks=XP3_ATTACKS,
+                           families=XP3_FAMILIES, react_delay=XP3_REACT_DELAY, params=params)
+
+
+def xp3_configs(overrides: dict) -> list[RunConfig]:
+    """320 main runs + 80 paired twins. A twin = a main run with W flipped on 1-3 blocks (same seed, same data)."""
+    main = [xp3_main_config(i, overrides) for i in range(XP3_MAIN)]
+    return main + paired_twins(main, 31_000, XP3_TWINS)
+
+
+# xp4 = xp3's design with signal set v2 (pilot_xp4.py: the memory signal x2_outlier_proj_max reveals 2/8 and 8/8
+# onsets while undefended, 1-3 blocks after the start). The schedule mix moves from probing to reacting at onset:
+# react delays are dense over 0-5 blocks (the 2/8 erasure window) and reach past the 1/8 window (~10 blocks).
+XP4_MAIN, XP4_TWINS, XP4_SEED0 = 320, 80, 20_000
+XP4_ATTACKS = {  # name -> (attack, poison_frac, share): weight on 2/8, the stealthy-but-detectable case
+    "pf1/8": ("backdoor_win", 0.125, 0.25),
+    "pf2/8": ("backdoor_win", 0.25, 0.35),
+    "pf8/8": ("backdoor_win", 1.0, 0.15),
+    "none": ("none", 1.0, 0.25),
+}
+XP4_FAMILIES = {"sticky": 0.25, "react": 0.40, "probe": 0.075, "probehold": 0.075, "on": 0.10, "off": 0.10}
+XP4_REACT_DELAY = [-4, 0, 1, 2, 3, 4, 5, 7, 10, 15, 20, 40]
+
+
+def xp4_main_config(i: int, overrides: dict) -> RunConfig:
+    params = {"C": XP1_C, "sigma": DEFAULT_SIGMA, "block_len": XP2_BLOCK_LEN, "n_blocks": XP2_BLOCKS,
+              "always_measure_backdoor": True, "signals": "v2"}
+    return windowed_config(i, overrides, rng_seed=70_000 + i, seed=XP4_SEED0 + i, attacks=XP4_ATTACKS,
+                           families=XP4_FAMILIES, react_delay=XP4_REACT_DELAY, params=params)
+
+
+def xp4_configs(overrides: dict) -> list[RunConfig]:
+    """320 main runs (seeds 20000-20319) + 80 paired twins, signals v2."""
+    main = [xp4_main_config(i, overrides) for i in range(XP4_MAIN)]
+    return main + paired_twins(main, 71_000, XP4_TWINS)
+
+
+def cmd_xp4(args: argparse.Namespace) -> None:
+    """xp4: xp3's design with the v2 signals (tail, scale-free, cross-round memory), onset-focused schedules."""
+    configs = xp4_configs(parse_overrides(args.set))
+    if args.seeds:
+        configs = configs[: args.seeds]
+    execute(configs, ROOT / (args.out or "runs_xp4"), args.jobs)
 
 
 def cmd_xp3(args: argparse.Namespace) -> None:
@@ -273,7 +320,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = parser.add_subparsers(dest="cmd", required=True)
     for name, fn in [("calibrate", cmd_calibrate), ("sanity", cmd_sanity), ("collect", cmd_collect),
-                     ("counterfactual", cmd_counterfactual), ("xp2", cmd_xp2), ("xp3", cmd_xp3),
+                     ("counterfactual", cmd_counterfactual), ("xp2", cmd_xp2), ("xp3", cmd_xp3), ("xp4", cmd_xp4),
                      ("report", cmd_report)]:
         sp = sub.add_parser(name)
         sp.set_defaults(fn=fn)

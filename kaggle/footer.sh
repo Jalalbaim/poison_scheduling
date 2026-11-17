@@ -57,6 +57,13 @@ run_xp3() {
   echo "== saved $(dirname "$WORK")/results_xp3.zip"
 }
 
+run_xp4() {
+  echo "== xp4: xp3 design + signals v2, onset-focused schedules, 80 paired twins (400 runs)"
+  "$PY" -u run_experiment.py xp4 --jobs "$JOBS" $EXTRA
+  (cd "$WORK" && zip -qr "$WORK/../results_xp4.zip" runs_xp4)
+  echo "== saved $(dirname "$WORK")/results_xp4.zip"
+}
+
 # GRU candidates for xp3: name hidden lr weight_decay. xp1/xp2 settings (64, 2e-3, 0) overfit xp3 after 2 epochs.
 XP3_SWEEP=("a 64 5e-4 0" "b 32 5e-4 1e-3" "c 64 2e-4 1e-2" "d 128 5e-4 1e-2")
 
@@ -116,6 +123,7 @@ case "$STAGE" in
   counterfactual) run_counterfactual ;;
   xp2)            run_xp2 ;;
   xp3)            run_xp3 ;;
+  xp4)            run_xp4 ;;
   xp3_deploy)     run_xp3_deploy ;;
 esac
 echo "== done in $((SECONDS / 60)) min"

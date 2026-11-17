@@ -118,3 +118,16 @@ def test_no_attack_uses_all_workers_honestly():
     b = simulate(RunConfig(attack="backdoor_win", defense="Krum", seed=2, window=(99, 99), **SHORT))
     cols = [c for c in a.columns if c.startswith(("x_", "y_clean"))]
     pd.testing.assert_frame_equal(a[cols], b[cols])
+
+
+def test_v2_signals_change_nothing_else():
+    from poison_testbed.signals import X2_COLUMNS
+
+    base = dict(attack="backdoor_win", defense="Krum", seed=3, schedule="on", window=(1, 2), poison_frac=0.25,
+                always_measure_backdoor=True, **SHORT)
+    v1, v2 = RunConfig(**base), RunConfig(**base, signals="v2")
+    assert v1.hash() == RunConfig(**base, signals="v1").hash() and v1.hash() != v2.hash()
+    a, b = simulate(v1), simulate(v2)
+    assert all(a[c].equals(b[c]) for c in a.columns)  # same training, same v1 signals, same outcomes
+    x2 = b[list(X2_COLUMNS)]
+    assert x2.iloc[0].isna().all() and x2.iloc[1:].notna().all().all()

@@ -9,6 +9,7 @@
 #     !bash run_kaggle.sh counterfactual   # GRU check 3: 384 runs, test seeds x candidate schedules
 #     !bash run_kaggle.sh xp2              # xp2: 260 runs, windowed backdoor + Krum, data with kills
 #     !bash run_kaggle.sh xp3              # xp3: 400 runs, stealthy backdoors, probes, paired twins
+#     !bash run_kaggle.sh xp4              # xp4: 400 runs, xp3 design + signals v2 (memory/tail signals), onset-focused
 #     !bash run_kaggle.sh xp3_deploy       # GRU sweep on xp3 + model selection + deployment (96 runs)
 #                                          #   needs results_xp3.zip attached as a Kaggle dataset (Add Input)
 #                                          #   -> /kaggle/working/xp3_deploy.zip
@@ -27,7 +28,7 @@
 set -euo pipefail
 
 STAGE="${1:-sanity}"
-case "$STAGE" in sanity|collect|all|counterfactual|xp2|xp3|xp3_deploy) ;; *) echo "usage: $0 [sanity|collect|all|counterfactual|xp2|xp3|xp3_deploy]"; exit 2;; esac
+case "$STAGE" in sanity|collect|all|counterfactual|xp2|xp3|xp4|xp3_deploy) ;; *) echo "usage: $0 [sanity|collect|all|counterfactual|xp2|xp3|xp4|xp3_deploy]"; exit 2;; esac
 if [ -d /kaggle/working ]; then DEFAULT_WORK=/kaggle/working/testbed; else DEFAULT_WORK="$PWD/testbed"; fi
 WORK="${WORK:-$DEFAULT_WORK}"
 JOBS="${JOBS:-$(nproc)}"
@@ -353,7 +354,7 @@ from krum.primitives.models.mlp import Krum2017MLPMnist
 from .aggregators import ClipNoise
 from .data import load_mnist
 from .poisoning import make_attack
-from .signals import X_COLUMNS
+from .signals import X2_COLUMNS, X_COLUMNS
 from .simulation import PoisoningSimulation
 
 # Bump when a code change should invalidate cached runs.
@@ -406,6 +407,9 @@ class RunConfig:
     # Measure backdoor success (y_atk) even without a trigger attack, e.g. in no-attack runs (xp3). It then
     # reads as the base rate (~1%), which teaches a model that without an attack the backdoor stays at 0.
     always_measure_backdoor: bool = False
+    # Signal set: "v1" = the 7 X columns of xp1-xp3; "v2" adds the X2 columns (tail, scale-free, memory; xp4).
+    # v2 changes no computation of the run itself: v1 columns, outcomes and training are identical.
+    signals: str = "v1"
     device: str = field(default_factory=lambda: "cuda" if torch.cuda.is_available() else "cpu")
 
     @property
@@ -427,7 +431,7 @@ class RunConfig:
         return hashlib.sha256(payload.encode()).hexdigest()[:16]
 
 
-LATER_FIELDS = {"burst": None, "always_measure_backdoor": False}
+LATER_FIELDS = {"burst": None, "always_measure_backdoor": False, "signals": "v1"}
 
 CF_SCHEDULE = re.compile(r"cf_(on|off|ontil20|offtil20|alt)_p(\d+)")
 PROBE_SCHEDULE = re.compile(r"probe_P(\d+)_L(\d+)_o(\d+)")
@@ -528,6 +532,7 @@ def build(cfg: RunConfig) -> PoisoningSimulation:
         schedule=make_schedule(cfg),
         block_len=cfg.block_len,
         C_ref=cfg.C,
+        signals_v2=cfg.signals == "v2",
         model_cls=Krum2017MLPMnist,
         train_datasets=[data.train] * cfg.n,
         test_set=torch.utils.data.TensorDataset(*data.test),
@@ -584,11 +589,17 @@ def simulate(cfg: RunConfig, policy: Policy | None = None) -> pd.DataFrame:
         lr = sim._current_lr
         per_round = [sim.step() for _ in range(cfg.block_len)]
         x_block = {c: sum(r[c] for r in per_round) / len(per_round) for c in X_COLUMNS}
+        if cfg.signals == "v2":  # block mean and block max of every v2 signal
+            for c in per_round[0]:
+                if c.startswith("x2_"):
+                    x_block[f"{c}_mean"] = sum(r[c] for r in per_round) / len(per_round)
+                    x_block[f"{c}_max"] = max(r[c] for r in per_round)
         active = sim.attack_spec.active(b)
         rows.append({**base, "block": b, "round_start": b * cfg.block_len, "lr": lr, "W": sim.schedule[b],
                      **x_block, **_outcomes(sim, cfg),
                      "u_active": int(active), "u_type": cfg.attack if active else "none", **extra})
-    df = pd.DataFrame(rows, columns=COLUMNS + extra_cols)
+    x2 = list(X2_COLUMNS) if cfg.signals == "v2" else []
+    df = pd.DataFrame(rows, columns=COLUMNS + x2 + extra_cols)
     return df.astype({"round_start": "Int64", "W": "Int64"})
 
 
@@ -668,6 +679,116 @@ def round_signals(gradients: torch.Tensor, losses: torch.Tensor, C: float) -> di
         losses.mean(),
     ])
     return dict(zip(X_COLUMNS, values.tolist()))
+
+
+# ----------------------------------------------------------------------------- signal set v2 (xp4)
+# Tail, scale-free and memory signals. Same rule as v1: computed from what the trainer sees in the round (the
+# micro-batch gradients, the per-sample losses and the training labels as given, poisoned or not), never from
+# which workers are Byzantine, whether an attack is active, the trigger or the target class.
+X2_SIGNALS = (
+    # A. per-sample loss tail
+    "loss_max_ratio",       # max sample loss / median sample loss
+    "loss_top3_ratio",      # mean of the 3 largest sample losses / median
+    "loss_tail_frac",       # share of samples above the 99th percentile of the previous TAIL_ROUNDS rounds' losses
+    # B. label-concentrated loss
+    "label_hiloss_max",     # among the TOPK highest-loss samples, the largest share carrying one same label
+    "label_loss_gap",       # max over labels of the label's mean loss / median over labels
+    # C. outlier micro-batches
+    "krum_top_ratio",       # mean of the f largest Krum scores / median Krum score
+    "mb_loss_max_ratio",    # max micro-batch loss / median micro-batch loss
+    "norm_max_ratio",       # max micro-batch gradient norm / median
+    # D. low-rank structure of the centred gradients
+    "sv_ratio",             # largest / second singular value
+    "sv_top_share",         # share of variance on the top direction
+    # E. cross-round consistency
+    "outlier_consistency",  # cosine between this round's outlier deviation and the running outlier direction
+    "outlier_proj_max",     # max over micro-batches of cos(g_i - median, running outlier direction)
+    # F. drift-normalised: z-score against the same signal over the previous Z_ROUNDS rounds
+    "z_loss_max_ratio", "z_krum_top_ratio", "z_sv_ratio", "z_mb_loss_max_ratio", "z_norm_std", "z_train_loss",
+)
+TAIL_ROUNDS, Z_ROUNDS, TOPK, EMA = 20, 50, 8, 0.9
+Z_BASE = {"z_loss_max_ratio": "loss_max_ratio", "z_krum_top_ratio": "krum_top_ratio", "z_sv_ratio": "sv_ratio",
+          "z_mb_loss_max_ratio": "mb_loss_max_ratio", "z_norm_std": "norm_std", "z_train_loss": "train_loss"}
+
+
+class SignalTrackerV2:
+    """Per-round v2 signals; keeps the cross-round state (loss history, running outlier direction, z windows)."""
+
+    def __init__(self, n: int, f: int):
+        self.n, self.f = n, f
+        self.loss_hist: list[torch.Tensor] = []
+        self.direction: torch.Tensor | None = None
+        self.z_hist: dict[str, list[float]] = {k: [] for k in Z_BASE.values()}
+
+    @torch.no_grad()
+    def __call__(self, gradients: torch.Tensor, mb_losses: torch.Tensor, sample_losses: torch.Tensor,
+                 sample_labels: torch.Tensor) -> dict[str, float]:
+        eps = 1e-12
+        g = gradients.double()
+        n, f = g.shape[0], self.f
+        out: dict[str, float] = {}
+        # A
+        sl = sample_losses.double()
+        med_l = sl.median().clamp_min(eps)
+        top = sl.topk(min(3, len(sl))).values
+        out["loss_max_ratio"] = float(sl.max() / med_l)
+        out["loss_top3_ratio"] = float(top.mean() / med_l)
+        if self.loss_hist:
+            q99 = torch.quantile(torch.cat(self.loss_hist), 0.99)
+            out["loss_tail_frac"] = float((sl > q99).double().mean())
+        else:
+            out["loss_tail_frac"] = 0.0
+        self.loss_hist = (self.loss_hist + [sl])[-TAIL_ROUNDS:]
+        # B
+        k = min(TOPK, len(sl))
+        hi_labels = sample_labels[sl.topk(k).indices]
+        out["label_hiloss_max"] = float(torch.bincount(hi_labels).max()) / k
+        labels = sample_labels.unique()
+        per_label = torch.stack([sl[sample_labels == c].mean() for c in labels])
+        out["label_loss_gap"] = float(per_label.max() / per_label.median().clamp_min(eps))
+        # C
+        d2 = torch.cdist(g, g) ** 2
+        m = max(1, n - f - 2)
+        krum = d2.sort(dim=1).values[:, 1: m + 1].sum(1)  # skip the zero self-distance
+        out["krum_top_ratio"] = float(krum.topk(f).values.mean() / krum.median().clamp_min(eps))
+        ml = mb_losses.double()
+        out["mb_loss_max_ratio"] = float(ml.max() / ml.median().clamp_min(eps))
+        norms = g.norm(dim=1)
+        out["norm_max_ratio"] = float(norms.max() / norms.median().clamp_min(eps))
+        # D (singular values from the n x n Gram matrix of the centred gradients)
+        c = g - g.mean(0)
+        ev = torch.linalg.eigvalsh(c @ c.T).flip(0).clamp_min(0)
+        sv = ev.sqrt()
+        out["sv_ratio"] = float(sv[0] / sv[1].clamp_min(eps))
+        out["sv_top_share"] = float(ev[0] / ev.sum().clamp_min(eps))
+        # E (outliers = the f micro-batches with the largest Krum scores)
+        med = g.sort(dim=0).values[(n - 1) // 2]  # coordinate-wise median (deterministic on CUDA)
+        dev = g - med
+        idx = krum.topk(f).indices
+        d = dev[idx].mean(0)
+        d = d / d.norm().clamp_min(eps)
+        if self.direction is None:
+            out["outlier_consistency"], out["outlier_proj_max"] = 0.0, 0.0
+            self.direction = d
+        else:
+            v = self.direction / self.direction.norm().clamp_min(eps)
+            out["outlier_consistency"] = float(d @ v)
+            out["outlier_proj_max"] = float((dev @ v / dev.norm(dim=1).clamp_min(eps)).max())
+            self.direction = EMA * self.direction + (1 - EMA) * d
+        # F
+        base = {**out, "norm_std": float(norms.std(correction=0)), "train_loss": float(ml.mean())}
+        for zname, b in Z_BASE.items():
+            h = self.z_hist[b]
+            if len(h) >= 5:
+                t = torch.tensor(h, dtype=torch.float64)
+                out[zname] = float((base[b] - t.mean()) / t.std(correction=0).clamp_min(1e-9))
+            else:
+                out[zname] = 0.0
+            self.z_hist[b] = (h + [base[b]])[-Z_ROUNDS:]
+        return {f"x2_{k}": out[k] for k in X2_SIGNALS}
+
+
+X2_COLUMNS = tuple(f"x2_{s}_{agg}" for s in X2_SIGNALS for agg in ("mean", "max"))
 __KRUM_TESTBED_EOF__
 cat > poison_testbed/simulation.py <<'__KRUM_TESTBED_EOF__'
 """PoisoningSimulation: the library's centralised SGD round, with data-poisoning workers,
@@ -699,7 +820,7 @@ from krum.simulations.centralised.krum_nips_2017 import KrumSimulation
 
 from .aggregators import ClipNoise, ScheduledAggregator
 from .poisoning import AttackSpec
-from .signals import round_signals
+from .signals import SignalTrackerV2, round_signals
 
 # Offsets that separate the seeded streams of one run.
 PERM_STREAM, NOISE_STREAM = 10_000, 20_000
@@ -717,6 +838,7 @@ class PoisoningSimulation(KrumSimulation):
         schedule: list[int],
         block_len: int,
         C_ref: float,
+        signals_v2: bool = False,
         **kwargs: Any,
     ) -> None:
         # The library's own aggregator/attack slots are left empty: this subclass's step() handles both.
@@ -729,6 +851,7 @@ class PoisoningSimulation(KrumSimulation):
         self.schedule = schedule
         self.block_len = block_len
         self.C_ref = C_ref
+        self.tracker = SignalTrackerV2(self.n, self.f) if signals_v2 else None
         if len(schedule) * block_len != self.rounds:
             raise ValueError(f"schedule covers {len(schedule) * block_len} rounds, expected {self.rounds}")
 
@@ -744,15 +867,22 @@ class PoisoningSimulation(KrumSimulation):
         self._perm_gen = torch.Generator(device=dev).manual_seed(self.seed + PERM_STREAM)
         self._noise_gen = torch.Generator(device=dev).manual_seed(self.seed + NOISE_STREAM)
 
-    def _grad_and_loss(self, x: torch.Tensor, y: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        """Same computation as the library's ``_train_one_worker``, also returning the loss."""
+    def _grad_and_loss(self, x: torch.Tensor, y: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Same computation as the library's ``_train_one_worker``, also returning the loss, and the per-sample
+        losses and labels when v2 signals are on (computed from the same logits, outside the autograd graph, so
+        the gradient is unchanged)."""
         assert self._model is not None
         self._model.module.train()
         x, y = x.to(self.device), y.to(self.device)
         self._model.module.zero_grad()
-        loss = self.loss_fn(self._model.module(x), y)
+        logits = self._model.module(x)
+        loss = self.loss_fn(logits, y)
         loss.backward()
-        return self._model.relink_gradients().clone(), loss.detach()
+        per_sample = None
+        if self.tracker is not None:
+            with torch.no_grad():
+                per_sample = torch.nn.functional.cross_entropy(logits.detach(), y, reduction="none")
+        return self._model.relink_gradients().clone(), loss.detach(), per_sample, y
 
     def step(self) -> dict[str, float]:
         if self._model is None:
@@ -765,6 +895,8 @@ class PoisoningSimulation(KrumSimulation):
 
         grads: list[torch.Tensor] = []
         losses: list[torch.Tensor] = []
+        sample_losses: list[torch.Tensor] = []
+        sample_labels: list[torch.Tensor] = []
         for w in range(self.n):
             x, y = next(iter(self._worker_loaders[w]))  # always drawn: keeps the data stream fixed
             byzantine = w >= n_honest and attacking
@@ -773,9 +905,12 @@ class PoisoningSimulation(KrumSimulation):
             if byzantine and spec.kind == "data":
                 assert spec.corrupt is not None
                 x, y = spec.corrupt(x, y, **self.corrupt_kwargs)
-            g, loss = self._grad_and_loss(x, y)
+            g, loss, per_sample, labels = self._grad_and_loss(x, y)
             grads.append(g)
             losses.append(loss)
+            if per_sample is not None:
+                sample_losses.append(per_sample)
+                sample_labels.append(labels)
 
         if attacking and spec.kind == "gradient":
             assert spec.attack_cls is not None
@@ -785,6 +920,11 @@ class PoisoningSimulation(KrumSimulation):
         perm = torch.randperm(self.n, generator=self._perm_gen, device=self.device)
         stacked = torch.stack(grads)[perm]
         x_round = round_signals(stacked, torch.stack(losses), self.C_ref)
+        if self.tracker is not None:
+            mb_losses = torch.stack(losses)
+            if len(mb_losses) == self.n:
+                mb_losses = mb_losses[perm]  # same order as the gradients
+            x_round.update(self.tracker(stacked, mb_losses, torch.cat(sample_losses), torch.cat(sample_labels)))
 
         noise = torch.randn(stacked.shape[1], generator=self._noise_gen, device=self.device, dtype=stacked.dtype)
         defense_kwargs = dict(self.defense_kwargs)
@@ -996,39 +1136,37 @@ XP3_PROBE_PERIOD = [3, 5, 10, 20]  # blocks between probes: from measure_erasure
 XP3_PROBE_LEN = [1, 2, 4]  # blocks per probe
 
 
-def xp3_main_config(i: int, overrides: dict) -> RunConfig:
-    """Main run i of xp3 (seed XP3_SEED0 + i): attack, window (real or phantom) and schedule drawn per run."""
-    rng = np.random.default_rng(30_000 + i)  # per-run stream
-    names = list(XP3_ATTACKS)
-    attack, pf, _ = XP3_ATTACKS[names[rng.choice(len(names), p=[v[2] for v in XP3_ATTACKS.values()])]]
+def windowed_config(i: int, overrides: dict, *, rng_seed: int, seed: int, attacks: dict, families: dict,
+                    react_delay: list, params: dict) -> RunConfig:
+    """One main run of xp3 / xp4: attack, window (real or phantom) and schedule drawn from a per-run stream."""
+    rng = np.random.default_rng(rng_seed)
+    names = list(attacks)
+    attack, pf, _ = attacks[names[rng.choice(len(names), p=[v[2] for v in attacks.values()])]]
     start = int(rng.integers(2, 21)) if rng.random() < 0.3 else int(rng.integers(21, 151))  # ~30% early
     window = (start, start + int(rng.integers(30, 81)) - 1)
-    family = rng.choice(list(XP3_FAMILIES), p=list(XP3_FAMILIES.values()))
+    family = rng.choice(list(families), p=list(families.values()))
     if family == "sticky":
         schedule = f"sticky_p{rng.choice(XP3_STICKY_P)}"
     elif family == "react":
-        schedule = f"react_d{rng.choice(XP3_REACT_DELAY)}_e{rng.choice(XP3_EXTRA)}"
+        schedule = f"react_d{rng.choice(react_delay)}_e{rng.choice(XP3_EXTRA)}"
     elif family in ("probe", "probehold"):
         period, length = int(rng.choice(XP3_PROBE_PERIOD)), int(rng.choice(XP3_PROBE_LEN))
         length = min(length, period - 1)
         schedule = f"probe_P{period}_L{length}_o{int(rng.integers(0, period))}"
         if family == "probehold":
             schedule = (f"probehold_P{period}_L{length}_o{int(rng.integers(0, period))}"
-                        f"_d{rng.choice(XP3_REACT_DELAY)}_e{rng.choice(XP3_EXTRA)}")
+                        f"_d{rng.choice(react_delay)}_e{rng.choice(XP3_EXTRA)}")
     else:
         schedule = str(family)
-    params = {"C": XP1_C, "sigma": DEFAULT_SIGMA, "block_len": XP2_BLOCK_LEN, "n_blocks": XP2_BLOCKS,
-              "always_measure_backdoor": True, **overrides}
-    return RunConfig(attack=attack, defense="Krum", seed=XP3_SEED0 + i, schedule=schedule, window=window,
-                     poison_frac=pf, **params)
+    return RunConfig(attack=attack, defense="Krum", seed=seed, schedule=schedule, window=window,
+                     poison_frac=pf, **{**params, **overrides})
 
 
-def xp3_configs(overrides: dict) -> list[RunConfig]:
-    """320 main runs + 80 paired twins. A twin = a main run with W flipped on 1-3 blocks (same seed, same data)."""
-    main = [xp3_main_config(i, overrides) for i in range(XP3_MAIN)]
-    rng = np.random.default_rng(31_000)
+def paired_twins(main: list[RunConfig], rng_seed: int, count: int) -> list[RunConfig]:
+    """Twins = main runs with W flipped on 1-3 blocks (same seed, same data): true short-term effects."""
+    rng = np.random.default_rng(rng_seed)
     twins = []
-    for i in sorted(rng.choice(XP3_MAIN, XP3_TWINS, replace=False)):
+    for i in sorted(rng.choice(len(main), count, replace=False)):
         base = main[i]
         if rng.random() < 0.5:  # around the attack start, where short changes matter most
             s = int(np.clip(base.window[0] + rng.integers(-5, 16), 0, XP2_BLOCKS - 1))
@@ -1036,7 +1174,56 @@ def xp3_configs(overrides: dict) -> list[RunConfig]:
             s = int(rng.integers(0, XP2_BLOCKS))
         ln = int(rng.integers(1, 4))
         twins.append(RunConfig(**{**base.__dict__, "schedule": f"{base.schedule}+flip_s{s}_l{min(ln, XP2_BLOCKS - s)}"}))
-    return main + twins
+    return twins
+
+
+def xp3_main_config(i: int, overrides: dict) -> RunConfig:
+    """Main run i of xp3 (seed XP3_SEED0 + i): attack, window (real or phantom) and schedule drawn per run."""
+    params = {"C": XP1_C, "sigma": DEFAULT_SIGMA, "block_len": XP2_BLOCK_LEN, "n_blocks": XP2_BLOCKS,
+              "always_measure_backdoor": True}
+    return windowed_config(i, overrides, rng_seed=30_000 + i, seed=XP3_SEED0 + i, attacks=XP3_ATTACKS,
+                           families=XP3_FAMILIES, react_delay=XP3_REACT_DELAY, params=params)
+
+
+def xp3_configs(overrides: dict) -> list[RunConfig]:
+    """320 main runs + 80 paired twins. A twin = a main run with W flipped on 1-3 blocks (same seed, same data)."""
+    main = [xp3_main_config(i, overrides) for i in range(XP3_MAIN)]
+    return main + paired_twins(main, 31_000, XP3_TWINS)
+
+
+# xp4 = xp3's design with signal set v2 (pilot_xp4.py: the memory signal x2_outlier_proj_max reveals 2/8 and 8/8
+# onsets while undefended, 1-3 blocks after the start). The schedule mix moves from probing to reacting at onset:
+# react delays are dense over 0-5 blocks (the 2/8 erasure window) and reach past the 1/8 window (~10 blocks).
+XP4_MAIN, XP4_TWINS, XP4_SEED0 = 320, 80, 20_000
+XP4_ATTACKS = {  # name -> (attack, poison_frac, share): weight on 2/8, the stealthy-but-detectable case
+    "pf1/8": ("backdoor_win", 0.125, 0.25),
+    "pf2/8": ("backdoor_win", 0.25, 0.35),
+    "pf8/8": ("backdoor_win", 1.0, 0.15),
+    "none": ("none", 1.0, 0.25),
+}
+XP4_FAMILIES = {"sticky": 0.25, "react": 0.40, "probe": 0.075, "probehold": 0.075, "on": 0.10, "off": 0.10}
+XP4_REACT_DELAY = [-4, 0, 1, 2, 3, 4, 5, 7, 10, 15, 20, 40]
+
+
+def xp4_main_config(i: int, overrides: dict) -> RunConfig:
+    params = {"C": XP1_C, "sigma": DEFAULT_SIGMA, "block_len": XP2_BLOCK_LEN, "n_blocks": XP2_BLOCKS,
+              "always_measure_backdoor": True, "signals": "v2"}
+    return windowed_config(i, overrides, rng_seed=70_000 + i, seed=XP4_SEED0 + i, attacks=XP4_ATTACKS,
+                           families=XP4_FAMILIES, react_delay=XP4_REACT_DELAY, params=params)
+
+
+def xp4_configs(overrides: dict) -> list[RunConfig]:
+    """320 main runs (seeds 20000-20319) + 80 paired twins, signals v2."""
+    main = [xp4_main_config(i, overrides) for i in range(XP4_MAIN)]
+    return main + paired_twins(main, 71_000, XP4_TWINS)
+
+
+def cmd_xp4(args: argparse.Namespace) -> None:
+    """xp4: xp3's design with the v2 signals (tail, scale-free, cross-round memory), onset-focused schedules."""
+    configs = xp4_configs(parse_overrides(args.set))
+    if args.seeds:
+        configs = configs[: args.seeds]
+    execute(configs, ROOT / (args.out or "runs_xp4"), args.jobs)
 
 
 def cmd_xp3(args: argparse.Namespace) -> None:
@@ -1091,7 +1278,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = parser.add_subparsers(dest="cmd", required=True)
     for name, fn in [("calibrate", cmd_calibrate), ("sanity", cmd_sanity), ("collect", cmd_collect),
-                     ("counterfactual", cmd_counterfactual), ("xp2", cmd_xp2), ("xp3", cmd_xp3),
+                     ("counterfactual", cmd_counterfactual), ("xp2", cmd_xp2), ("xp3", cmd_xp3), ("xp4", cmd_xp4),
                      ("report", cmd_report)]:
         sp = sub.add_parser(name)
         sp.set_defaults(fn=fn)
@@ -1233,6 +1420,19 @@ def test_no_attack_uses_all_workers_honestly():
     b = simulate(RunConfig(attack="backdoor_win", defense="Krum", seed=2, window=(99, 99), **SHORT))
     cols = [c for c in a.columns if c.startswith(("x_", "y_clean"))]
     pd.testing.assert_frame_equal(a[cols], b[cols])
+
+
+def test_v2_signals_change_nothing_else():
+    from poison_testbed.signals import X2_COLUMNS
+
+    base = dict(attack="backdoor_win", defense="Krum", seed=3, schedule="on", window=(1, 2), poison_frac=0.25,
+                always_measure_backdoor=True, **SHORT)
+    v1, v2 = RunConfig(**base), RunConfig(**base, signals="v2")
+    assert v1.hash() == RunConfig(**base, signals="v1").hash() and v1.hash() != v2.hash()
+    a, b = simulate(v1), simulate(v2)
+    assert all(a[c].equals(b[c]) for c in a.columns)  # same training, same v1 signals, same outcomes
+    x2 = b[list(X2_COLUMNS)]
+    assert x2.iloc[0].isna().all() and x2.iloc[1:].notna().all().all()
 __KRUM_TESTBED_EOF__
 cat > analyze.py <<'__KRUM_TESTBED_EOF__'
 """Step 4: causal analysis of the randomized-defense logs.
@@ -2750,6 +2950,13 @@ run_xp3() {
   echo "== saved $(dirname "$WORK")/results_xp3.zip"
 }
 
+run_xp4() {
+  echo "== xp4: xp3 design + signals v2, onset-focused schedules, 80 paired twins (400 runs)"
+  "$PY" -u run_experiment.py xp4 --jobs "$JOBS" $EXTRA
+  (cd "$WORK" && zip -qr "$WORK/../results_xp4.zip" runs_xp4)
+  echo "== saved $(dirname "$WORK")/results_xp4.zip"
+}
+
 # GRU candidates for xp3: name hidden lr weight_decay. xp1/xp2 settings (64, 2e-3, 0) overfit xp3 after 2 epochs.
 XP3_SWEEP=("a 64 5e-4 0" "b 32 5e-4 1e-3" "c 64 2e-4 1e-2" "d 128 5e-4 1e-2")
 
@@ -2809,6 +3016,7 @@ case "$STAGE" in
   counterfactual) run_counterfactual ;;
   xp2)            run_xp2 ;;
   xp3)            run_xp3 ;;
+  xp4)            run_xp4 ;;
   xp3_deploy)     run_xp3_deploy ;;
 esac
 echo "== done in $((SECONDS / 60)) min"
