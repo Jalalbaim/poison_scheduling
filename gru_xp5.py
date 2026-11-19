@@ -18,6 +18,16 @@ Steps:
      trajectory, on seen test runs (overall and per attack family) and on each held-out group; kill awareness;
   3. decision margins for deployment (deploy_xp5.py), calibrated on validation seeds (Youden point of check P):
      'release' (after a defended block: keep defending or not) and 'free' (from every block: defend or not).
+  4. benefit check: at every block of the seen test runs and held-out groups, the predicted attack success of
+     'defend the next H blocks' vs 'do not defend' (positive benefit = the GRU believes defending helps).
+
+xp5a (--exclude-schedules react probehold): the 'react' and 'probehold' schedules switch the defense on at the
+TRUE attack window (an unobservable), so in their runs a planned W = 1 announces an attack (P(attack in the next
+20 blocks | W switches on) = 0.98 vs 0.31). The decoder, which receives the planned W, then learns 'W = 1 ->
+high attack success', which cancels the real effect of the defense. With the option, training and validation use
+only the runs whose schedule ignores the window (sticky, probe, on, off); the split itself (assign_splits on all
+seen runs) and the test / held-out sets are unchanged, so every number is comparable with xp5. --compare scores
+the xp5 model (its summary.json) on the same sets, with its own normalisation.
 """
 
 import argparse
@@ -53,6 +63,52 @@ def groups_of(df: pd.DataFrame) -> pd.Series:
     g = pd.Series([xp5_heldout_group(a, t, pf, d) for a, t, pf, d in
                    zip(first.attack, first.u_trigger, first.poison_frac, first.defense)], index=first.index)
     return df.run_id.map(g)
+
+
+SCHEDULE_FAMILIES = ("sticky", "react", "probehold", "probe", "on", "off")
+
+
+def schedule_family(run_id: pd.Series) -> pd.Series:
+    """run_id = <attack>__<defense>__<schedule>__s<seed>; family = the schedule's leading word (twins: of the base)."""
+    fam = run_id.str.split("__").str[2].str.extract(r"^([a-z]+)", expand=False)
+    unknown = set(fam.dropna().unique()) - set(SCHEDULE_FAMILIES) | ({"<missing>"} if fam.isna().any() else set())
+    if unknown:
+        raise ValueError(f"unknown schedule families in run ids: {sorted(unknown)}")
+    return fam
+
+
+def seen_splits(df: pd.DataFrame, exclude: list[str]) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame,
+                                                                pd.DataFrame]:
+    """(seen, train, val, test). The split is drawn on all seen runs (as in xp5); `exclude` then removes schedule
+    families from train and val only. The test set always keeps every schedule."""
+    seen = df[groups_of(df) == "seen"]
+    split = assign_splits(seen)
+    for name in ("val", "test"):  # only for tiny (smoke-test) data: groups of 1-2 seeds all land in train
+        if not (split == name).any():
+            seeds = sorted(seen.seed[split == "train"].unique())[1::5]
+            split[seen.seed.isin(seeds)] = name
+            print(f"warning: no {name} runs (tiny data): moved seeds {seeds} from train to {name}", flush=True)
+    keep = ~schedule_family(seen.run_id).isin(exclude)
+    return seen, seen[(split == "train") & keep], seen[(split == "val") & keep], seen[split == "test"]
+
+
+@torch.no_grad()
+def benefit(model: OutcomeGRU, data: Data, device) -> pd.DataFrame:
+    """At every block with a full horizon left: predicted attack success after H blocks if not defending minus
+    if defending (> 0: the GRU believes defending lowers attack success), and the predicted change in clean
+    accuracy (defend - not; < 0 = the cost). gain = clean_change + LAMBDA * benefit_atk."""
+    check_probe.ALT, check_probe.CUTS = "release", "all"
+    t = check_probe.gains(model, data, device)
+    t = t[t.attack != "alie_win"].copy()  # no targeted outcome
+    t["defense"] = t.run.map(dict(zip(data.run_ids, data.defense)))
+    t["benefit_atk"] = t.atk_probe - t.atk_defend  # 'probe' column = the alternative plan (here: do not defend)
+    t["clean_change"] = t.gain - check_probe.LAMBDA * t.benefit_atk
+    return t
+
+
+def benefit_table(t: pd.DataFrame) -> pd.DataFrame:
+    t = t.assign(state=np.where(t.active, "attack active", "no attack active"))
+    return t.groupby(["model", "set", "defense", "state"])[["benefit_atk", "clean_change", "gain"]].mean().reset_index()
 
 
 def train_models(train: Data, val: Data, out: Path, device, epochs: int, models: list[str]) -> dict:
@@ -131,6 +187,10 @@ def main() -> None:
     ap.add_argument("--out", type=Path, default=Path("results/xp5/gru"))
     ap.add_argument("--epochs", type=int, default=300)
     ap.add_argument("--models", nargs="*", default=list(MODELS))
+    ap.add_argument("--exclude-schedules", nargs="*", default=[], choices=SCHEDULE_FAMILIES,
+                    help="schedule families left out of training and validation (xp5a: react probehold)")
+    ap.add_argument("--compare", type=Path, default=None,
+                    help="summary.json of an earlier model (xp5), scored on the same sets for the benefit check")
     args = ap.parse_args()
     sys.stdout.reconfigure(encoding="utf-8")
     args.out.mkdir(parents=True, exist_ok=True)
@@ -138,18 +198,14 @@ def main() -> None:
 
     df = analyze.load(args.runs)
     df["group"] = groups_of(df)
-    seen = df[df.group == "seen"]
-    split = assign_splits(seen)
-    for name in ("val", "test"):  # only for tiny (smoke-test) data: groups of 1-2 seeds all land in train
-        if not (split == name).any():
-            seeds = sorted(seen.seed[split == "train"].unique())[1::5]
-            split[seen.seed.isin(seeds)] = name
-            print(f"warning: no {name} runs (tiny data): moved seeds {seeds} from train to {name}", flush=True)
-    train = Data(seen[split == "train"])
-    val = Data(seen[split == "val"], train.x_mean, train.x_std, train.x_cols)
-    test_df = seen[split == "test"]
+    seen, train_df, val_df, test_df = seen_splits(df, args.exclude_schedules)
+    train = Data(train_df)
+    val = Data(val_df, train.x_mean, train.x_std, train.x_cols)
+    fam = schedule_family(train_df.groupby("run_id").run_id.first())
     print(f"runs: train {len(train.seed)}, val {len(val.seed)}, test (seen) {test_df.run_id.nunique()}, held-out "
           f"{df[df.group != 'seen'].run_id.nunique()}; {len(train.x_cols)} input signals; device {device}", flush=True)
+    print(f"training schedules: {fam.value_counts().to_dict()}; excluded: {args.exclude_schedules or 'none'}",
+          flush=True)
 
     reports = train_models(train, val, args.out, device, args.epochs, args.models)
     best = min(reports, key=lambda k: reports[k]["best_val_mse"])
@@ -165,24 +221,41 @@ def main() -> None:
     for g in sorted(df.group.unique()):
         if g != "seen":
             sets[f"held-out: {g}"] = df[df.group == g]
-    tables, kills = [], []
+    # Models scored by the benefit check: this one, and optionally the earlier one with its own normalisation.
+    scored = {"this model": (model, train)}
+    if args.compare:
+        prev = json.loads(args.compare.read_text())
+        _, prev_train_df, _, _ = seen_splits(df, prev.get("exclude_schedules", []))
+        prev_train = Data(prev_train_df)
+        scored["compared model"] = (load_model(Path(prev["selected_folder"]), prev_train, device), prev_train)
+        print(f"compared model: {prev['selected_folder']} (excluded schedules: "
+              f"{prev.get('exclude_schedules') or 'none'})", flush=True)
+
+    tables, kills, bens = [], [], []
     for name, sub in sets.items():
         data = Data(sub, train.x_mean, train.x_std, train.x_cols)
         tables.append(check1(model, ridge, train, data, device).assign(set=name, runs=len(data.seed)))
-        k = check_kill(model, data, device, args.out)
-        if len(k):
-            kills.append(k.assign(set=name))
+        for tag, (m, tr) in scored.items():
+            d = data if tr is train else Data(sub, tr.x_mean, tr.x_std, tr.x_cols)
+            k = check_kill(m, d, device, args.out)
+            if len(k):
+                kills.append(k.assign(set=name, model=tag))
+            bens.append(benefit(m, d, device).assign(set=name, model=tag))
     (args.out / "checkK_kill.csv").unlink(missing_ok=True)  # check_kill writes per call; the combined file is below
     table = pd.concat(tables, ignore_index=True)
     table.to_csv(args.out / "prediction_error.csv", index=False)
     kill = pd.concat(kills, ignore_index=True) if kills else pd.DataFrame()
     if len(kill):
         kill.to_csv(args.out / "kill_awareness.csv", index=False)
+    ben = benefit_table(pd.concat(bens, ignore_index=True))
+    ben.to_csv(args.out / "benefit.csv", index=False)
     fig_errors(table, args.out)
     marg = margins(model, val, device)
     summary = {"selected": best, "selected_folder": str(args.out / best), "models": {k: {kk: v[kk] for kk in
                ("hparams", "epochs", "best_val_mse", "weights_sha256")} for k, v in reports.items()},
-               "margins": marg, "support": support(seen)}
+               "margins": marg, "exclude_schedules": args.exclude_schedules,
+               "train_schedules": {str(k): int(v) for k, v in fam.value_counts().items()},
+               "support": support(seen)}
     (args.out / "summary.json").write_text(json.dumps(summary, indent=2, default=float))
 
     pd.set_option("display.width", 220)
@@ -192,8 +265,17 @@ def main() -> None:
     if len(kill):
         print("\n## Kill awareness: predicted attack success at window end if defending from the 2nd attack block "
               "vs never")
-        print(kill.groupby("set")[["gru_atk_window_end_if_defend", "gru_atk_window_end_if_never",
-                                   "actual_atk_window_end"]].mean().round(3).to_string())
+        print(kill.groupby(["model", "set"])[["gru_atk_window_end_if_defend", "gru_atk_window_end_if_never",
+                                              "actual_atk_window_end"]].mean().round(3).to_string())
+    print("\n## Benefit check (seen test + held-out, every block): predicted attack success removed by defending "
+          "the next H blocks (> 0 = defending helps), predicted clean-accuracy change (< 0 = cost), gain = sum")
+    b = ben[ben.state == "attack active"]
+    print("attack active:")
+    print(b.pivot_table(index=["set", "defense"], columns="model", values=["benefit_atk", "clean_change", "gain"],
+                        sort=False).round(3).to_string())
+    print("no attack active (benefit should be ~0):")
+    b = ben[ben.state == "no attack active"]
+    print(b.groupby(["model", "defense"])[["benefit_atk", "clean_change", "gain"]].mean().round(3).to_string())
     print("\n## Decision margins (validation seeds)")
     print(json.dumps(marg, indent=2))
 

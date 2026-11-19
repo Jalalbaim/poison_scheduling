@@ -20,6 +20,16 @@ Policies (same seed = same data and noise):
                   keep defending (gain of 'defend H blocks' over 'stop for H blocks' > margin)
     gru_free      the GRU alone: defend iff the gain of defending for H blocks over not defending > margin
 Margins and the model come from gru_xp5.py (validation seeds only).
+
+xp5a options:
+    --end-rule freeze   in the last HORIZON blocks the GRU keeps its latest decision instead of planning over a
+                        shortened horizon (xp5's 'shrink' made the GRU alone defend the last ~10 blocks); identical
+                        decisions before that point. The alarm still switches the defense on (policy gru).
+    --reuse DIR         copy runs of the non-GRU policies from an earlier deployment when their config is the
+                        same (same seed, environment, schedule, alarm threshold): they do not depend on the GRU.
+    --compare DIR       show the earlier deployment's gru / gru_free runs next to the new ones (policies
+                        gru_xp5 / gru_free_xp5).
+The alarm is always fitted on all seen training runs (as in xp5), whatever schedules the GRU was trained on.
 Harm: attack success (backdoor success, flip rate) for targeted attacks; for ALIE, the clean-accuracy gap to
 clean_ref of the same seed.
 """
@@ -27,6 +37,7 @@ clean_ref of the same seed.
 import argparse
 import hashlib
 import json
+import shutil
 import sys
 import time
 from concurrent.futures import ProcessPoolExecutor, as_completed
@@ -67,15 +78,22 @@ ENVIRONMENTS = {  # name -> (RunConfig fields, defense, held out?)
 }
 SEEDS_PER_ENV = 3
 POLICIES = ["clean_ref", "off", "on", "oracle", "threshold", "gru", "gru_free"]
+COMPARED = {"gru": "gru_xp5", "gru_free": "gru_free_xp5"}  # earlier deployment's GRU runs (--compare)
+ALL_POLICIES = POLICIES + list(COMPARED.values())
+NON_GRU = ["clean_ref", "off", "on", "oracle", "threshold"]
 V1, V2, BIN, HOLD, HORIZON, LAMBDA = "x_norm_std", "x2_outlier_proj_max_max", 25, 20, 20, 1.0
+TITLE = "xp5"  # figure titles (main: --title)
 
 POLICY_COLOR = {"clean_ref": "#52514e", "off": "#1baf7a", "on": "#eb6834", "oracle": "#e87ba4",
-                "threshold": "#008300", "gru": "#2a78d6", "gru_free": "#104281"}
+                "threshold": "#008300", "gru": "#2a78d6", "gru_free": "#104281",
+                "gru_xp5": "#9ec2ee", "gru_free_xp5": "#8a94a6"}
 POLICY_LABEL = {"clean_ref": "no-attack reference", "off": "always off", "on": "always on",
                 "oracle": "oracle (defends exactly the attack)", "threshold": "threshold defender (old OR new signal)",
-                "gru": "GRU (alarm on, GRU decides release)", "gru_free": "GRU alone"}
-SHORT = {"oracle": "oracle", "threshold": "threshold", "gru": "GRU", "gru_free": "GRU alone"}
-DRAW_ORDER = ["clean_ref", "off", "on", "oracle", "threshold", "gru_free", "gru"]
+                "gru": "GRU (alarm on, GRU decides release)", "gru_free": "GRU alone",
+                "gru_xp5": "xp5 GRU (alarm on, GRU decides release)", "gru_free_xp5": "xp5 GRU alone"}
+SHORT = {"oracle": "oracle", "threshold": "threshold", "gru": "GRU", "gru_free": "GRU alone",
+         "gru_xp5": "xp5 GRU", "gru_free_xp5": "xp5 GRU alone"}
+DRAW_ORDER = ["clean_ref", "off", "on", "oracle", "threshold", "gru_free_xp5", "gru_xp5", "gru_free", "gru"]
 
 
 def environment(env: str, k: int, smoke: bool = False) -> tuple[int, tuple[int, int]]:
@@ -174,16 +192,22 @@ class GRUScorer:
                 "gru_clean_wait": float(p[0, 0]), "gru_clean_defend": float(p[1, 0])}
 
 
+def frozen(scorer: GRUScorer, b: int, end_rule: str) -> bool:
+    """'freeze': no GRU decision once fewer than HORIZON blocks are left (the plan of block b covers b..b+H-1);
+    'shrink' (xp5): decide with H = the blocks left."""
+    return end_rule == "freeze" and scorer.n_blocks - b < HORIZON
+
+
 class GRURelease:
-    def __init__(self, scorer: GRUScorer, alarm: dict, delta: float):
-        self.scorer, self.alarm, self.delta, self.on = scorer, alarm, delta, False
+    def __init__(self, scorer: GRUScorer, alarm: dict, delta: float, end_rule: str = "shrink"):
+        self.scorer, self.alarm, self.delta, self.on, self.end_rule = scorer, alarm, delta, False, end_rule
 
     def __call__(self, history: list[dict], b: int) -> tuple[int, dict]:
         hit, z = alarm_of(history, self.alarm)
         extra = {"alarm": int(hit), "alarm_z": z}
         if hit:
             self.on = True
-        elif self.on:
+        elif self.on and not frozen(self.scorer, b, self.end_rule):
             g = self.scorer.gain(history, b)
             extra.update(g)
             self.on = g["gru_gain"] > self.delta
@@ -191,12 +215,15 @@ class GRURelease:
 
 
 class GRUFree:
-    def __init__(self, scorer: GRUScorer, delta: float):
-        self.scorer, self.delta = scorer, delta
+    def __init__(self, scorer: GRUScorer, delta: float, end_rule: str = "shrink"):
+        self.scorer, self.delta, self.end_rule, self.last = scorer, delta, end_rule, 0
 
     def __call__(self, history: list[dict], b: int) -> tuple[int, dict]:
+        if frozen(self.scorer, b, self.end_rule):
+            return self.last, {}
         g = self.scorer.gain(history, b)
-        return int(g["gru_gain"] > self.delta), g
+        self.last = int(g["gru_gain"] > self.delta)
+        return self.last, g
 
 
 # ----------------------------------------------------------------------------- runs
@@ -220,18 +247,41 @@ def run_id_of(env: str, policy: str, k: int, smoke: bool) -> str:
     return f"{slug}__{policy}__s{environment(env, k, smoke)[0]}"
 
 
+def expected_meta(env: str, policy: str, k: int, ctx: dict) -> dict:
+    """What a finished run's config.json must match to be kept (or reused) instead of run again."""
+    cfg = config(env, policy, k, ctx["smoke"])
+    meta = {"config": json.loads(json.dumps(cfg.__dict__, default=str))}
+    if policy in ("threshold", "gru"):
+        meta["alarm_threshold"] = ctx["alarm"]["threshold"]
+    if policy.startswith("gru"):
+        meta["gru_weights_sha256"] = hashlib.sha256((Path(ctx["gru_folder"]) / "gru.pt").read_bytes()).hexdigest()[:16]
+        meta["margins"] = ctx["margins"]
+        meta["end_rule"] = ctx["end_rule"]
+    return meta
+
+
+def matches(folder: Path, meta: dict) -> bool:
+    if not ((folder / "blocks.csv").exists() and (folder / "config.json").exists()):
+        return False
+    stored = json.loads((folder / "config.json").read_text())
+    stored.setdefault("end_rule", "shrink")  # xp5 runs predate the option
+    return all(stored.get(key) == value for key, value in meta.items())
+
+
 def run_one(env: str, policy: str, k: int, ctx: dict, out_root: str) -> tuple[str, float]:
     smoke = ctx["smoke"]
     cfg = config(env, policy, k, smoke)
     run_id = run_id_of(env, policy, k, smoke)
     out = Path(out_root) / "runs" / run_id
-    if (out / "blocks.csv").exists():
+    if matches(out, expected_meta(env, policy, k, ctx)):
         return run_id, json.loads((out / "config.json").read_text())["wall_clock_s"]
     folder = Path(ctx["gru_folder"])
+    rule = ctx["end_rule"]
     scorer = lambda: GRUScorer(folder, ctx["stats"], cfg.device, cfg.n_blocks)  # noqa: E731
     controller = {"threshold": lambda: Threshold(ctx["alarm"]),
-                  "gru": lambda: GRURelease(scorer(), ctx["alarm"], ctx["margins"]["release_defended"]["delta"]),
-                  "gru_free": lambda: GRUFree(scorer(), ctx["margins"]["release_all"]["delta"])}.get(policy, lambda: None)()
+                  "gru": lambda: GRURelease(scorer(), ctx["alarm"], ctx["margins"]["release_defended"]["delta"], rule),
+                  "gru_free": lambda: GRUFree(scorer(), ctx["margins"]["release_all"]["delta"], rule),
+                  }.get(policy, lambda: None)()
     started = time.time()
     df = simulate(cfg, controller).copy()
     wall = time.time() - started
@@ -247,7 +297,7 @@ def run_one(env: str, policy: str, k: int, ctx: dict, out_root: str) -> tuple[st
         "gru_model": str(folder) if policy.startswith("gru") else None,
         "gru_weights_sha256": hashlib.sha256((folder / "gru.pt").read_bytes()).hexdigest()[:16]
         if policy.startswith("gru") else None, "margins": ctx["margins"], "alarm_threshold": ctx["alarm"]["threshold"],
-        "horizon": HORIZON, "lambda": LAMBDA, "hold": HOLD, "wall_clock_s": round(wall, 1),
+        "horizon": HORIZON, "lambda": LAMBDA, "hold": HOLD, "end_rule": rule, "wall_clock_s": round(wall, 1),
         "device_name": torch.cuda.get_device_name(0) if cfg.device == "cuda" else cfg.device,
     }, indent=2, default=str))
     return run_id, wall
@@ -290,7 +340,7 @@ def summarize(blocks: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
                "mean_attack_success_in_window", "neutralised", "clean_vs_on_pts", "defended_blocks",
                "false_alarm_blocks", "reaction_delay_blocks"]
     agg = per_run.groupby(["environment", "policy"], sort=False)[metrics].mean().round(4).reset_index()
-    agg["policy"] = pd.Categorical(agg.policy, POLICIES)
+    agg["policy"] = pd.Categorical(agg.policy, ALL_POLICIES)
     agg["environment"] = pd.Categorical(agg.environment, list(ENVIRONMENTS))
     return per_run.sort_values(["environment", "policy", "seed"]), agg.sort_values(["environment", "policy"])
 
@@ -304,7 +354,7 @@ def fig_environment(blocks: pd.DataFrame, env: str, out: Path) -> None:
     g["harm"] = (ref.reindex(list(zip(g.seed, g.block))).to_numpy() - g.y_clean_acc) if is_alie else g.y_atk
     seeds = sorted(g.seed.unique())
     present = [p for p in DRAW_ORDER if p in set(g.policy) and not (p == "clean_ref" and not is_alie)]
-    deciders = [p for p in ["gru", "gru_free", "threshold", "oracle"] if p in present]
+    deciders = [p for p in ["gru", "gru_free", "gru_xp5", "gru_free_xp5", "threshold", "oracle"] if p in present]
     fig, axes = plt.subplots(3, len(seeds), figsize=(3.9 * len(seeds) + 0.6, 8.6), sharex=True, squeeze=False,
                              gridspec_kw={"height_ratios": [1, 1, 0.6]})
     no_attack = g.attack.eq("none").all() and not is_alie
@@ -353,7 +403,7 @@ def fig_environment(blocks: pd.DataFrame, env: str, out: Path) -> None:
                for p in present]
     if not no_attack:
         handles.append(Patch(color=INK2, alpha=0.15, label="attack active"))
-    fig.suptitle(f"xp5 deployment (Fashion-MNIST): {env}: trajectories and defense decisions (same seed = same data "
+    fig.suptitle(f"{TITLE} deployment (Fashion-MNIST): {env}: trajectories and defense decisions (same seed = same data "
                  f"and noise)", fontsize=10, color=INK, x=0.01, y=0.995, ha="left")
     top = 1 - 0.8 / fig.get_figheight()
     fig.legend(handles=handles, loc="upper left", bbox_to_anchor=(0.01, top + 0.045), ncol=4, fontsize=8)
@@ -365,7 +415,7 @@ def fig_environment(blocks: pd.DataFrame, env: str, out: Path) -> None:
 
 def fig_summary(per_run: pd.DataFrame, out: Path) -> None:
     envs = [e for e in ENVIRONMENTS if e in set(per_run.environment)]
-    pols = [p for p in POLICIES if p != "clean_ref"]
+    pols = [p for p in ALL_POLICIES if p != "clean_ref" and p in set(per_run.policy)]
     panels = [("harm", "harm: final attack success (backdoor), mean in window (flip),\nclean acc. lost vs no attack (ALIE)"),
               ("clean_gap_to_no_attack_final", "final clean acc. − no-attack reference"),
               ("defended_blocks", "defended blocks")]
@@ -392,15 +442,33 @@ def fig_summary(per_run: pd.DataFrame, out: Path) -> None:
                         fontsize=8)
     handles = [Line2D([], [], color=POLICY_COLOR[q], marker="o", linewidth=2, label=POLICY_LABEL[q]) for q in pols]
     fig.legend(handles=handles, loc="upper left", bbox_to_anchor=(0.01, 0.955), ncol=3, fontsize=8)
-    fig.suptitle("xp5 deployment summary (dots = seeds, bar = mean; shaded = held-out configurations)",
+    fig.suptitle(f"{TITLE} deployment summary (dots = seeds, bar = mean; shaded = held-out configurations)",
                  fontsize=10, color=INK, x=0.01, y=0.995, ha="left")
     fig.tight_layout(rect=(0, 0, 1, 0.9))
     fig.savefig(out / "summary_by_policy.png", dpi=120)
     plt.close(fig)
 
 
-def report(out: Path) -> None:
-    blocks = pd.concat([pd.read_csv(f) for f in sorted((out / "runs").glob("*/blocks.csv"))], ignore_index=True)
+def compared_runs(folder: Path, seeds: set) -> list[pd.DataFrame]:
+    """The earlier deployment's gru / gru_free runs, relabelled gru_xp5 / gru_free_xp5 (same seeds only)."""
+    out = []
+    for f in sorted((folder / "runs").glob("*/blocks.csv")):
+        d = pd.read_csv(f, low_memory=False)
+        pol = d.policy.iloc[0]
+        if pol in COMPARED and int(d.seed.iloc[0]) in seeds:
+            d["policy"] = COMPARED[pol]
+            d["run_id"] = d.run_id.str.replace(f"__{pol}__", f"__{COMPARED[pol]}__", regex=False)
+            out.append(d)
+    return out
+
+
+def report(out: Path, compare: Path | None = None) -> None:
+    frames = [pd.read_csv(f, low_memory=False) for f in sorted((out / "runs").glob("*/blocks.csv"))]
+    if compare is not None:
+        old = compared_runs(compare, {int(d.seed.iloc[0]) for d in frames})
+        print(f"compared with {compare}: {len(old)} GRU runs of the earlier deployment", flush=True)
+        frames += old
+    blocks = pd.concat(frames, ignore_index=True)
     blocks.to_csv(out / "blocks_all.csv", index=False)
     per_run, agg = summarize(blocks)
     per_run.to_csv(out / "summary_runs.csv", index=False)
@@ -421,31 +489,53 @@ def main() -> None:
     ap.add_argument("--out", type=Path, default=OUT)
     ap.add_argument("--report-only", action="store_true")
     ap.add_argument("--smoke", action="store_true", help="30 blocks, 1 seed, 2 environments")
+    ap.add_argument("--policies", nargs="*", default=POLICIES, choices=POLICIES)
+    ap.add_argument("--end-rule", choices=["shrink", "freeze"], default="shrink")
+    ap.add_argument("--reuse", type=Path, default=None, help="earlier deployment folder: reuse its non-GRU runs")
+    ap.add_argument("--compare", type=Path, default=None, help="earlier deployment folder: show its GRU runs")
+    ap.add_argument("--title", default="xp5")
     args = ap.parse_args()
+    global TITLE
+    TITLE = args.title
     sys.stdout.reconfigure(encoding="utf-8")
     args.out.mkdir(parents=True, exist_ok=True)
+    compare = None if args.smoke else args.compare  # smoke runs are 30 blocks long: nothing to compare with
     if not args.report_only:
         summary = json.loads(args.gru_summary.read_text())
-        df = pd.read_csv(args.runs)
-        from gru_xp5 import groups_of  # same seen / held-out labelling as the GRU training
+        df = pd.read_csv(args.runs, low_memory=False)
+        from gru_xp5 import seen_splits  # same seen / held-out labelling and split as the GRU training
         df = df.sort_values(["run_id", "block"]).reset_index(drop=True)
-        seen = df[groups_of(df) == "seen"]
-        train_df = seen[assign_splits(seen) == "train"]
-        train = Data(train_df)
+        exclude = summary.get("exclude_schedules", [])
+        _, alarm_df, _, _ = seen_splits(df, [])         # the alarm: all seen training runs, as in xp5
+        _, gru_df, _, _ = seen_splits(df, exclude)      # the GRU's normalisation: the runs it was trained on
+        train = Data(gru_df)
         ctx = {"smoke": args.smoke, "gru_folder": summary["selected_folder"], "margins": summary["margins"],
                "stats": {"x_mean": train.x_mean, "x_std": train.x_std, "x_cols": train.x_cols},
-               "alarm": fit_alarm(train_df)}
+               "alarm": fit_alarm(alarm_df), "end_rule": args.end_rule}
         (args.out / "alarm.json").write_text(json.dumps(ctx["alarm"], indent=2))
+        print(f"GRU {summary['selected_folder']} (trained without schedules: {exclude or 'none'}), "
+              f"end rule {args.end_rule}, alarm threshold {ctx['alarm']['threshold']:.3f}", flush=True)
         envs = list(ENVIRONMENTS)[:2] if args.smoke else list(ENVIRONMENTS)
         ks = range(1) if args.smoke else range(SEEDS_PER_ENV)
-        jobs = [(e, p, k) for p in POLICIES for e in envs for k in ks]
+        jobs = [(e, p, k) for p in args.policies for e in envs for k in ks]
+        if args.reuse is not None:
+            reused = 0
+            for e, p, k in jobs:
+                if p not in NON_GRU:
+                    continue
+                run_id = run_id_of(e, p, k, args.smoke)
+                src, dst = args.reuse / "runs" / run_id, args.out / "runs" / run_id
+                if not matches(dst, expected_meta(e, p, k, ctx)) and matches(src, expected_meta(e, p, k, ctx)):
+                    shutil.copytree(src, dst, dirs_exist_ok=True)
+                    reused += 1
+            print(f"reused {reused} non-GRU runs from {args.reuse}", flush=True)
         started = time.time()
         with ProcessPoolExecutor(max_workers=args.jobs, mp_context=get_context("spawn")) as pool:
             futs = [pool.submit(run_one, e, p, k, ctx, str(args.out)) for e, p, k in jobs]
             for n, fut in enumerate(as_completed(futs), 1):
                 run_id, wall = fut.result()
                 print(f"[{n}/{len(jobs)}] {run_id}  {wall:.0f}s  (elapsed {time.time() - started:.0f}s)", flush=True)
-    report(args.out)
+    report(args.out, compare)
 
 
 if __name__ == "__main__":

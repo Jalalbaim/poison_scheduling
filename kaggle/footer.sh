@@ -128,6 +128,64 @@ PYCHECK
   xp5_zip
 }
 
+# xp5a: the GRU retrained without the schedules that switch the defense on at the true attack window (react,
+# probehold), deployed again (GRU policies only; the other policies are reused from xp5 when their config matches).
+find_xp5_prev() {  # folder that holds results/xp5/gru/summary.json and results/deploy_xp5/runs (unzipped xp5_all)
+  if [ -n "${XP5_PREV:-}" ]; then echo "$XP5_PREV"; return; fi
+  local f
+  f=$(find /kaggle/input -path '*results/xp5/gru/summary.json' 2>/dev/null | head -1)
+  if [ -z "$f" ]; then
+    local z; z=$(find /kaggle/input -name 'xp5_all*.zip' 2>/dev/null | head -1)
+    if [ -n "$z" ]; then
+      unzip -qo "$z" 'results/xp5/gru/*' 'results/deploy_xp5/runs/*' 'results/xp5/runs_xp5/all_blocks.csv' \
+        -d "$WORK/xp5_prev_unzipped" && f="$WORK/xp5_prev_unzipped/results/xp5/gru/summary.json"
+    fi
+  fi
+  [ -n "$f" ] && dirname "$(dirname "$(dirname "$(dirname "$f")")")"
+}
+
+xp5a_zip() {
+  (cd "$WORK" && rm -f "$WORK/../xp5a_all.zip" && zip -qr "$WORK/../xp5a_all.zip" \
+     $(ls -d results/xp5a results/deploy_xp5a xp5a_logs 2>/dev/null))
+  echo "== saved $(dirname "$WORK")/xp5a_all.zip"
+}
+
+run_xp5a() {
+  local smoke="${XP5_SMOKE:-0}" prev data
+  prev=$(find_xp5_prev || true)
+  if [ -z "$prev" ] || [ ! -f "$prev/results/xp5/gru/summary.json" ]; then
+    echo "xp5 results not found: attach xp5_all.zip as a dataset (Add Input) or set XP5_PREV=/folder/holding/results"; exit 1
+  fi
+  echo "== xp5 results from: $prev"
+  data=$(find_xp5_data)
+  [ -z "$data" ] && data="$prev/results/xp5/runs_xp5/all_blocks.csv"
+  if [ ! -f "$data" ]; then echo "xp5 data not found (all_blocks.csv)"; exit 1; fi
+  mkdir -p results/xp5/runs_xp5 results/xp5a xp5a_logs
+  cp "$data" results/xp5/runs_xp5/all_blocks.csv
+  rm -rf results/xp5/gru && cp -r "$prev/results/xp5/gru" results/xp5/gru  # the xp5 model (summary paths are relative)
+  "$PY" - "$smoke" <<'PYCHECK'
+import json, sys
+import pandas as pd
+d = pd.read_csv("results/xp5/runs_xp5/all_blocks.csv", usecols=["run_id", "block"])
+n, rows = d.run_id.nunique(), sorted(d.groupby("run_id").size().unique())
+s = json.load(open("results/xp5/gru/summary.json"))
+print(f"xp5 data: {n} runs, rows per run {rows}; xp5 model {s['selected_folder']}")
+if sys.argv[1] != "1" and (n != 600 or rows != [251]):
+    raise SystemExit("unexpected xp5 data: expected 600 runs x 251 rows")
+PYCHECK
+  local ep=(); [ "$smoke" = "1" ] && ep=(--epochs 2)
+  echo "== xp5a step 1: GRU without the react / probehold schedules (3 candidates, selected on validation) + benefit check vs xp5"
+  "$PY" -u gru_xp5.py --runs results/xp5/runs_xp5/all_blocks.csv --out results/xp5a/gru \
+    --exclude-schedules react probehold --compare results/xp5/gru/summary.json "${ep[@]}" | tee xp5a_logs/gru.txt
+  xp5a_zip
+  local dsm=(); [ "$smoke" = "1" ] && dsm=(--smoke)
+  echo "== xp5a step 2: deployment (10 environments x 3 seeds; GRU policies rerun, end rule 'freeze'; others reused)"
+  "$PY" -u deploy_xp5.py --jobs "$JOBS" --gru-summary results/xp5a/gru/summary.json --out results/deploy_xp5a \
+    --end-rule freeze --reuse "$prev/results/deploy_xp5" --compare "$prev/results/deploy_xp5" --title xp5a \
+    "${dsm[@]}" | tee xp5a_logs/deploy.txt
+  xp5a_zip
+}
+
 # GRU candidates for xp3: name hidden lr weight_decay. xp1/xp2 settings (64, 2e-3, 0) overfit xp3 after 2 epochs.
 XP3_SWEEP=("a 64 5e-4 0" "b 32 5e-4 1e-3" "c 64 2e-4 1e-2" "d 128 5e-4 1e-2")
 
@@ -191,6 +249,7 @@ case "$STAGE" in
   xp5_pilot)      run_xp5_pilot ;;
   xp5_data)       run_xp5_data ;;
   xp5_final)      run_xp5_final ;;
+  xp5a)           run_xp5a ;;
   xp3_deploy)     run_xp3_deploy ;;
 esac
 echo "== done in $((SECONDS / 60)) min"

@@ -16,6 +16,9 @@
 #                                          #   -> /kaggle/working/results_xp5_data.zip   (~6.5 h)
 #     !bash run_kaggle.sh xp5_final        # xp5 step 2: single mixed GRU + deployment + pilot -> xp5_all.zip
 #                                          #   needs results_xp5_data.zip attached as a dataset (Add Input) (~5.5 h)
+#     !bash run_kaggle.sh xp5a             # xp5a: GRU retrained without react/probehold schedules + benefit check
+#                                          #   + GRU deployment (end rule 'freeze') -> xp5a_all.zip
+#                                          #   needs xp5_all.zip attached as a dataset (Add Input) (~2 h)
 #     !bash run_kaggle.sh xp3_deploy       # GRU sweep on xp3 + model selection + deployment (96 runs)
 #                                          #   needs results_xp3.zip attached as a Kaggle dataset (Add Input)
 #                                          #   -> /kaggle/working/xp3_deploy.zip
@@ -36,7 +39,7 @@
 set -euo pipefail
 
 STAGE="${1:-sanity}"
-case "$STAGE" in sanity|collect|all|counterfactual|xp2|xp3|xp4|xp5_pilot|xp5_data|xp5_final|xp3_deploy) ;; *) echo "usage: $0 [sanity|collect|all|counterfactual|xp2|xp3|xp4|xp5_pilot|xp5_data|xp5_final|xp3_deploy]"; exit 2;; esac
+case "$STAGE" in sanity|collect|all|counterfactual|xp2|xp3|xp4|xp5_pilot|xp5_data|xp5_final|xp5a|xp3_deploy) ;; *) echo "usage: $0 [sanity|collect|all|counterfactual|xp2|xp3|xp4|xp5_pilot|xp5_data|xp5_final|xp5a|xp3_deploy]"; exit 2;; esac
 if [ -d /kaggle/working ]; then DEFAULT_WORK=/kaggle/working/testbed; else DEFAULT_WORK="$PWD/testbed"; fi
 WORK="${WORK:-$DEFAULT_WORK}"
 JOBS="${JOBS:-$(nproc)}"
