@@ -149,3 +149,26 @@ def test_xp5_attacks_and_outcomes():
     # the attack never shifts the honest data stream: identical signals before the window
     none = simulate(RunConfig(attack="none", **common))
     assert none.x_norm_std.iloc[1] == flip.x_norm_std.iloc[1]
+
+
+def test_alarm_schedule_state_machine():
+    from poison_testbed.alarm import AlarmSchedule
+    table = {f"Krum|{w}|0": [0.0, 1.0, 0.0, 1.0] for w in (0, 1)}  # z = the raw values
+    z = [0, 3, 0, 0, 0, 0, 0, 3, 0, 0, 0, 0]  # alarms (tau 2) at blocks 1 and 7
+    pol, hist, w = AlarmSchedule(tau=2.0, delay=2, hold=3, table=table), [{"block": -1, "W": None}], []
+    for b in range(len(z)):
+        wb, _ = pol(hist, b)
+        w.append(wb)
+        hist.append({"block": b, "W": wb, "defense": "Krum", "x_norm_std": float(z[b]),
+                     "x2_outlier_proj_max_max": -9.0})
+    # alarm seen after block 1 -> on from block 2 + 2 = 4, held 3 quiet blocks; block 7's alarm -> on from 10
+    assert w == [0, 0, 0, 0, 1, 1, 1, 0, 0, 0, 1, 1]
+
+
+def test_alarm_schedule_ignores_the_true_window():
+    common = dict(attack="none", defense="Krum", seed=5, schedule="alarm_t2.0_d0_h5", dataset="fmnist",
+                  signals="v2", extended_log=True, C=3.0, sigma=0.01, n_blocks=6, block_len=2)
+    a = simulate(RunConfig(window=(1, 3), **common))
+    b = simulate(RunConfig(window=(4, 5), **common))
+    assert a.W.tolist() == b.W.tolist()  # no attack: the window is a phantom; W depends only on what is observed
+    assert simulate(RunConfig(window=(1, 3), **common)).equals(a)  # reproducible

@@ -76,28 +76,52 @@ ENVIRONMENTS = {  # name -> (RunConfig fields, defense, held out?)
     "corner 3/8 | TrimmedMean (held-out)": (dict(attack="backdoor_win", poison_frac=0.375), "TrimmedMean", True),
     "flip 8/8 | TrimmedMean (held-out)": (dict(attack="flip_win", poison_frac=1.0), "TrimmedMean", True),
 }
+# xp6 (--experiment xp6): Krum only, backdoor (patch triggers) and targeted label flip; held out: blend, 3/8.
+ENVIRONMENTS_XP6 = {
+    "backdoor corner 1/8 | Krum": (dict(attack="backdoor_win", poison_frac=0.125), "Krum", False),
+    "backdoor corner 2/8 | Krum": (dict(attack="backdoor_win", poison_frac=0.25), "Krum", False),
+    "backdoor patch 2/8 | Krum": (dict(attack="backdoor_win", poison_frac=0.25, trigger="patch_r3_c5"), "Krum", False),
+    "backdoor patch 8/8 | Krum": (dict(attack="backdoor_win", poison_frac=1.0, trigger="patch_r3_c5"), "Krum", False),
+    "burst corner 8/8 | Krum": (dict(attack="backdoor_burst", poison_frac=1.0, burst=(10, 5)), "Krum", False),
+    "flip 2/8 | Krum": (dict(attack="flip_win", poison_frac=0.25), "Krum", False),
+    "flip 8/8 | Krum": (dict(attack="flip_win", poison_frac=1.0), "Krum", False),
+    "no attack | Krum": (dict(attack="none"), "Krum", False),
+    "blend 2/8 | Krum (held-out)": (dict(attack="backdoor_win", poison_frac=0.25, trigger="blend"), "Krum", True),
+    "corner 3/8 | Krum (held-out)": (dict(attack="backdoor_win", poison_frac=0.375), "Krum", True),
+}
+EXPERIMENTS = {"xp5": (ENVIRONMENTS, 8000), "xp6": (ENVIRONMENTS_XP6, 9000)}  # environments, first seed
+SEED0 = 8000
 SEEDS_PER_ENV = 3
 POLICIES = ["clean_ref", "off", "on", "oracle", "threshold", "gru", "gru_free"]
+EXTRA_POLICIES = ["threshold_low"]  # xp6: the same alarm with a low threshold (catches 2/8 onsets, many alarms)
+LOW_TAU = 2.0
 COMPARED = {"gru": "gru_xp5", "gru_free": "gru_free_xp5"}  # earlier deployment's GRU runs (--compare)
-ALL_POLICIES = POLICIES + list(COMPARED.values())
-NON_GRU = ["clean_ref", "off", "on", "oracle", "threshold"]
+ALL_POLICIES = POLICIES + EXTRA_POLICIES + list(COMPARED.values())
+NON_GRU = ["clean_ref", "off", "on", "oracle", "threshold", "threshold_low"]
 V1, V2, BIN, HOLD, HORIZON, LAMBDA = "x_norm_std", "x2_outlier_proj_max_max", 25, 20, 20, 1.0
+
+
+def use_experiment(name: str) -> None:
+    """Select the environment set (module globals, so that spawned workers can be switched too)."""
+    global ENVIRONMENTS, SEED0
+    ENVIRONMENTS, SEED0 = EXPERIMENTS[name]
 TITLE = "xp5"  # figure titles (main: --title)
 
 POLICY_COLOR = {"clean_ref": "#52514e", "off": "#1baf7a", "on": "#eb6834", "oracle": "#e87ba4",
-                "threshold": "#008300", "gru": "#2a78d6", "gru_free": "#104281",
+                "threshold": "#008300", "threshold_low": "#a0c93f", "gru": "#2a78d6", "gru_free": "#104281",
                 "gru_xp5": "#9ec2ee", "gru_free_xp5": "#8a94a6"}
 POLICY_LABEL = {"clean_ref": "no-attack reference", "off": "always off", "on": "always on",
                 "oracle": "oracle (defends exactly the attack)", "threshold": "threshold defender (old OR new signal)",
+                "threshold_low": f"threshold defender, low threshold (z > {LOW_TAU})",
                 "gru": "GRU (alarm on, GRU decides release)", "gru_free": "GRU alone",
                 "gru_xp5": "xp5 GRU (alarm on, GRU decides release)", "gru_free_xp5": "xp5 GRU alone"}
-SHORT = {"oracle": "oracle", "threshold": "threshold", "gru": "GRU", "gru_free": "GRU alone",
+SHORT = {"oracle": "oracle", "threshold": "threshold", "threshold_low": "low threshold", "gru": "GRU", "gru_free": "GRU alone",
          "gru_xp5": "xp5 GRU", "gru_free_xp5": "xp5 GRU alone"}
-DRAW_ORDER = ["clean_ref", "off", "on", "oracle", "threshold", "gru_free_xp5", "gru_xp5", "gru_free", "gru"]
+DRAW_ORDER = ["clean_ref", "off", "on", "oracle", "threshold", "threshold_low", "gru_free_xp5", "gru_xp5", "gru_free", "gru"]
 
 
 def environment(env: str, k: int, smoke: bool = False) -> tuple[int, tuple[int, int]]:
-    seed = 8000 + 100 * list(ENVIRONMENTS).index(env) + k
+    seed = SEED0 + 100 * list(ENVIRONMENTS).index(env) + k
     if smoke:
         return seed, (5, 20)
     rng = np.random.default_rng(90_000 + seed)
@@ -251,7 +275,7 @@ def expected_meta(env: str, policy: str, k: int, ctx: dict) -> dict:
     """What a finished run's config.json must match to be kept (or reused) instead of run again."""
     cfg = config(env, policy, k, ctx["smoke"])
     meta = {"config": json.loads(json.dumps(cfg.__dict__, default=str))}
-    if policy in ("threshold", "gru"):
+    if policy in ("threshold", "threshold_low", "gru"):
         meta["alarm_threshold"] = ctx["alarm"]["threshold"]
     if policy.startswith("gru"):
         meta["gru_weights_sha256"] = hashlib.sha256((Path(ctx["gru_folder"]) / "gru.pt").read_bytes()).hexdigest()[:16]
@@ -269,6 +293,7 @@ def matches(folder: Path, meta: dict) -> bool:
 
 
 def run_one(env: str, policy: str, k: int, ctx: dict, out_root: str) -> tuple[str, float]:
+    use_experiment(ctx.get("experiment", "xp5"))  # spawned workers start from the module defaults
     smoke = ctx["smoke"]
     cfg = config(env, policy, k, smoke)
     run_id = run_id_of(env, policy, k, smoke)
@@ -279,6 +304,7 @@ def run_one(env: str, policy: str, k: int, ctx: dict, out_root: str) -> tuple[st
     rule = ctx["end_rule"]
     scorer = lambda: GRUScorer(folder, ctx["stats"], cfg.device, cfg.n_blocks)  # noqa: E731
     controller = {"threshold": lambda: Threshold(ctx["alarm"]),
+                  "threshold_low": lambda: Threshold({**ctx["alarm"], "threshold": LOW_TAU}),
                   "gru": lambda: GRURelease(scorer(), ctx["alarm"], ctx["margins"]["release_defended"]["delta"], rule),
                   "gru_free": lambda: GRUFree(scorer(), ctx["margins"]["release_all"]["delta"], rule),
                   }.get(policy, lambda: None)()
@@ -354,7 +380,8 @@ def fig_environment(blocks: pd.DataFrame, env: str, out: Path) -> None:
     g["harm"] = (ref.reindex(list(zip(g.seed, g.block))).to_numpy() - g.y_clean_acc) if is_alie else g.y_atk
     seeds = sorted(g.seed.unique())
     present = [p for p in DRAW_ORDER if p in set(g.policy) and not (p == "clean_ref" and not is_alie)]
-    deciders = [p for p in ["gru", "gru_free", "gru_xp5", "gru_free_xp5", "threshold", "oracle"] if p in present]
+    deciders = [p for p in ["gru", "gru_free", "gru_xp5", "gru_free_xp5", "threshold", "threshold_low", "oracle"]
+                if p in present]
     fig, axes = plt.subplots(3, len(seeds), figsize=(3.9 * len(seeds) + 0.6, 8.6), sharex=True, squeeze=False,
                              gridspec_kw={"height_ratios": [1, 1, 0.6]})
     no_attack = g.attack.eq("none").all() and not is_alie
@@ -489,7 +516,10 @@ def main() -> None:
     ap.add_argument("--out", type=Path, default=OUT)
     ap.add_argument("--report-only", action="store_true")
     ap.add_argument("--smoke", action="store_true", help="30 blocks, 1 seed, 2 environments")
-    ap.add_argument("--policies", nargs="*", default=POLICIES, choices=POLICIES)
+    ap.add_argument("--policies", nargs="*", default=POLICIES, choices=POLICIES + EXTRA_POLICIES)
+    ap.add_argument("--experiment", choices=list(EXPERIMENTS), default="xp5", help="environment set")
+    ap.add_argument("--alarm-file", type=Path, default=None,
+                    help="fixed alarm (z tables + threshold) instead of fitting it on the training runs (xp6)")
     ap.add_argument("--end-rule", choices=["shrink", "freeze"], default="shrink")
     ap.add_argument("--reuse", type=Path, default=None, help="earlier deployment folder: reuse its non-GRU runs")
     ap.add_argument("--compare", type=Path, default=None, help="earlier deployment folder: show its GRU runs")
@@ -497,6 +527,7 @@ def main() -> None:
     args = ap.parse_args()
     global TITLE
     TITLE = args.title
+    use_experiment(args.experiment)
     sys.stdout.reconfigure(encoding="utf-8")
     args.out.mkdir(parents=True, exist_ok=True)
     compare = None if args.smoke else args.compare  # smoke runs are 30 blocks long: nothing to compare with
@@ -511,7 +542,8 @@ def main() -> None:
         train = Data(gru_df)
         ctx = {"smoke": args.smoke, "gru_folder": summary["selected_folder"], "margins": summary["margins"],
                "stats": {"x_mean": train.x_mean, "x_std": train.x_std, "x_cols": train.x_cols},
-               "alarm": fit_alarm(alarm_df), "end_rule": args.end_rule}
+               "alarm": json.loads(args.alarm_file.read_text()) if args.alarm_file else fit_alarm(alarm_df),
+               "end_rule": args.end_rule, "experiment": args.experiment}
         (args.out / "alarm.json").write_text(json.dumps(ctx["alarm"], indent=2))
         print(f"GRU {summary['selected_folder']} (trained without schedules: {exclude or 'none'}), "
               f"end rule {args.end_rule}, alarm threshold {ctx['alarm']['threshold']:.3f}", flush=True)

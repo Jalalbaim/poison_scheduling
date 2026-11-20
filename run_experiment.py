@@ -363,6 +363,104 @@ def xp5_configs(overrides: dict) -> list[RunConfig]:
     return main + paired_twins(main, 81_000, XP5_TWINS) + heldout
 
 
+# xp6 = xp5's Fashion-MNIST setting, Krum only, backdoor (patch triggers) and targeted label flip only (no ALIE).
+# xp5a showed that 'react' / 'probehold' schedules (defense on at the TRUE window) leak the attack to the outcome
+# model through the planned W. xp6 has no such schedule: 'alarm' schedules react to the observable alarm
+# (poison_testbed/alarm.py; tau 2.0 catches 2/8 onsets within ~1 block on the xp5 Krum logs, ~12 alarm onsets per
+# no-attack run; tau 3.67 is the xp5 deployment alarm), and every other schedule ignores the window. Twins flip W
+# on 10-40 blocks starting at a uniformly drawn block (never placed relative to the run's own window).
+XP6_MAIN, XP6_TWINS, XP6_HELDOUT = 400, 60, 40
+XP6_SEED0, XP6_HELDOUT_SEED0 = 40_000, 41_000
+XP6_FAMILIES = {"none": 0.20, "backdoor": 0.45, "burst": 0.10, "flip": 0.25}
+XP6_BACKDOOR_PF = {0.125: 0.35, 0.25: 0.40, 1.0: 0.25}  # weight on the stealthy rates (the open problem)
+XP6_SCHEDULES = {"alarm": 0.45, "sticky": 0.20, "probe": 0.10, "on": 0.10, "off": 0.15}
+XP6_ALARM_TAU = [2.0, 2.5, 3.0, 3.67]
+XP6_ALARM_DELAY = [0, 1, 2, 5, 10, 20]  # blocks after the alarm: 20 = too late for 2/8 (negative examples)
+XP6_ALARM_HOLD = [5, 10, 20, 40]
+XP6_TWIN_LEN = [10, 20, 40]
+XP6_HELDOUT_GROUPS = ["blend trigger", "poison rate 3/8"]
+
+
+def xp6_schedule(rng: np.random.Generator) -> str:
+    family = rng.choice(list(XP6_SCHEDULES), p=list(XP6_SCHEDULES.values()))
+    if family == "alarm":
+        return (f"alarm_t{rng.choice(XP6_ALARM_TAU)}_d{rng.choice(XP6_ALARM_DELAY)}"
+                f"_h{rng.choice(XP6_ALARM_HOLD)}")
+    if family == "sticky":
+        return f"sticky_p{rng.choice(XP3_STICKY_P)}"
+    if family == "probe":
+        period, length = int(rng.choice(XP3_PROBE_PERIOD)), int(rng.choice(XP3_PROBE_LEN))
+        length = min(length, period - 1)
+        return f"probe_P{period}_L{length}_o{int(rng.integers(0, period))}"
+    return str(family)
+
+
+def xp6_main_config(i: int, overrides: dict) -> RunConfig:
+    rng = np.random.default_rng(100_000 + i)
+    family = rng.choice(list(XP6_FAMILIES), p=list(XP6_FAMILIES.values()))
+    target = int(rng.choice(XP5_TARGETS))
+    window = _xp5_window(rng)
+    fields: dict = {"target": target}
+    if family == "none":
+        fields.update(attack="none", trigger=str(rng.choice(XP5_TRIGGERS)))  # trigger: base-rate measurement only
+    elif family == "backdoor":
+        fields.update(attack="backdoor_win", trigger=str(rng.choice(XP5_TRIGGERS)),
+                      poison_frac=float(rng.choice(list(XP6_BACKDOOR_PF), p=list(XP6_BACKDOOR_PF.values()))))
+    elif family == "burst":
+        fields.update(attack="backdoor_burst", trigger=str(rng.choice(XP5_TRIGGERS)),
+                      poison_frac=float(rng.choice([0.25, 1.0])),
+                      burst=tuple(int(v) for v in XP5_BURSTS[int(rng.integers(len(XP5_BURSTS)))]))
+    else:
+        fields.update(attack="flip_win", poison_frac=float(rng.choice([0.25, 1.0])),
+                      flip_source=int(rng.choice(XP5_FLIP_SOURCES)))
+    return RunConfig(defense="Krum", seed=XP6_SEED0 + i, schedule=xp6_schedule(rng), window=window,
+                     **fields, **xp5_params(overrides))
+
+
+def xp6_heldout_config(j: int, overrides: dict) -> RunConfig:
+    rng = np.random.default_rng(102_000 + j)
+    group = XP6_HELDOUT_GROUPS[j % len(XP6_HELDOUT_GROUPS)]
+    target = int(rng.choice(XP5_TARGETS))
+    window = _xp5_window(rng)
+    if group == "blend trigger":
+        fields = dict(attack="backdoor_win", trigger="blend", poison_frac=float(rng.choice([0.25, 1.0])))
+    else:
+        fields = dict(attack="backdoor_win", trigger=str(rng.choice(XP5_TRIGGERS)), poison_frac=0.375)
+    return RunConfig(defense="Krum", seed=XP6_HELDOUT_SEED0 + j, schedule=xp6_schedule(rng), window=window,
+                     target=target, **fields, **xp5_params(overrides))
+
+
+def xp6_twins(main: list[RunConfig]) -> list[RunConfig]:
+    """Twins = main runs (non-alarm schedules) with W flipped on [s, s + l): s uniform over the run, independent
+    of the run's window (no leak), l in 10-40 blocks. Same seed and data: the true effect of a long change."""
+    rng = np.random.default_rng(101_000)
+    pool = [k for k, c in enumerate(main) if not c.schedule.startswith("alarm")]
+    twins = []
+    for k in sorted(rng.choice(pool, XP6_TWINS, replace=False)):
+        base = main[k]
+        n = base.n_blocks
+        ln = int(rng.choice(XP6_TWIN_LEN))
+        s = int(rng.integers(0, max(1, n - ln)))
+        twins.append(RunConfig(**{**base.__dict__, "schedule": f"{base.schedule}+flip_s{s}_l{min(ln, n - s)}"}))
+    return twins
+
+
+def xp6_configs(overrides: dict) -> list[RunConfig]:
+    """400 main runs + 60 paired twins (seen) + 40 held-out runs = 500, all Krum."""
+    main = [xp6_main_config(i, overrides) for i in range(XP6_MAIN)]
+    heldout = [xp6_heldout_config(j, overrides) for j in range(XP6_HELDOUT)]
+    return main + xp6_twins(main) + heldout
+
+
+def cmd_xp6(args: argparse.Namespace) -> None:
+    """xp6 data: Fashion-MNIST, Krum only, backdoor + targeted flip, alarm-driven (leak-free) schedules."""
+    configs = xp6_configs(parse_overrides(args.set))
+    if args.seeds:  # smoke tests: a spread of runs (every k-th), so every family and the held-out set appear
+        step = max(1, len(configs) // args.seeds)
+        configs = configs[::step][: args.seeds]
+    execute(configs, ROOT / (args.out or "runs_xp6"), args.jobs)
+
+
 def cmd_xp5(args: argparse.Namespace) -> None:
     """xp5 data: Fashion-MNIST, backdoor variants / bursts / targeted flip / ALIE, Krum / Median / TrimmedMean."""
     configs = xp5_configs(parse_overrides(args.set))
@@ -432,7 +530,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = parser.add_subparsers(dest="cmd", required=True)
     for name, fn in [("calibrate", cmd_calibrate), ("sanity", cmd_sanity), ("collect", cmd_collect),
-                     ("counterfactual", cmd_counterfactual), ("xp2", cmd_xp2), ("xp3", cmd_xp3), ("xp4", cmd_xp4), ("xp5", cmd_xp5),
+                     ("counterfactual", cmd_counterfactual), ("xp2", cmd_xp2), ("xp3", cmd_xp3), ("xp4", cmd_xp4), ("xp5", cmd_xp5), ("xp6", cmd_xp6),
                      ("report", cmd_report)]:
         sp = sub.add_parser(name)
         sp.set_defaults(fn=fn)

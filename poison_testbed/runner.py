@@ -24,6 +24,7 @@ from krum.primitives.aggregators.trimmed_mean import TrimmedMean
 from krum.primitives.models.mlp import Krum2017MLPMnist
 
 from .aggregators import ClipNoise
+from .alarm import alarm_policy, is_alarm_schedule
 from .data import load_data, load_mnist, make_trigger
 from .poisoning import make_attack
 from .signals import X2_COLUMNS, X_COLUMNS
@@ -61,6 +62,7 @@ class RunConfig:
     sigma: float
     # "random" | "on" | "off" | "policy" | "cf_<on|off|ontil20|offtil20|alt>_p<prefix>"
     # | "sticky_p<switch prob>" | "react_d<delay>_e<extra>" (blocks, relative to `window`)
+    # | "alarm_t<tau>_d<delay>_h<hold>" (xp6: online, reacts to the observable alarm; see alarm.py)
     schedule: str = "random"
     schedule_seed: int | None = None  # default: 1000 + seed
     n: int = 16
@@ -158,6 +160,8 @@ def make_schedule(cfg: RunConfig) -> list[int]:
     if m := FLIP_SUFFIX.fullmatch(cfg.schedule):
         # Paired twin: the base schedule with W flipped on blocks [s, s + l). Same seed, so the pair gives the
         # true effect of that short change.
+        if is_alarm_schedule(m.group(1)):
+            raise ValueError("twins of alarm schedules are not defined (their W is decided online)")
         base = make_schedule(replace(cfg, schedule=m.group(1)))
         s, ln = int(m.group(2)), int(m.group(3))
         return [1 - w if s <= b < s + ln else w for b, w in enumerate(base)]
@@ -177,7 +181,7 @@ def make_schedule(cfg: RunConfig) -> list[int]:
     if cfg.schedule == "random":
         gen = torch.Generator().manual_seed(cfg.sched_seed)
         return torch.bernoulli(torch.full((cfg.n_blocks,), 0.5), generator=gen).int().tolist()
-    if cfg.schedule == "policy":
+    if cfg.schedule == "policy" or is_alarm_schedule(cfg.schedule):
         return [0] * cfg.n_blocks  # placeholder: each entry is set online by the policy before its block runs
     if cfg.schedule == "oracle":
         # Defend exactly the blocks where the attack is active (knows the attack: an upper reference only).
@@ -278,6 +282,8 @@ def simulate(cfg: RunConfig, policy: Policy | None = None) -> pd.DataFrame:
     ``policy(history, b) -> (W_b, extra)``, if given, decides W for block b before it runs. ``history`` holds the
     observable part of rows -1..b-1 only (see ``observable``). ``extra`` is logged on block b's row.
     """
+    if policy is None and is_alarm_schedule(cfg.schedule):  # xp6: W decided online from the observable alarm
+        policy = alarm_policy(cfg.schedule)
     sim = build(cfg)
     base = {"run_id": cfg.run_id, "seed": cfg.seed, "schedule_seed": cfg.sched_seed, "defense": cfg.defense,
             "attack": cfg.attack, "poison_frac": cfg.poison_frac, "n": cfg.n, "f": cfg.f}
@@ -341,7 +347,7 @@ def run(cfg: RunConfig, out_root: Path) -> tuple[pd.DataFrame, dict[str, Any]]:
         "run_id": cfg.run_id,
         "config_hash": cfg.hash(),
         "config": asdict(cfg),
-        "schedule": make_schedule(cfg),
+        "schedule": ([int(w) for w in df.W.iloc[1:]] if is_alarm_schedule(cfg.schedule) else make_schedule(cfg)),
         "testbed_version": TESTBED_VERSION,
         "krum_version": krum.__version__,
         "krum_git_commit": _git_commit(),

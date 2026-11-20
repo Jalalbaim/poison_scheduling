@@ -19,6 +19,10 @@
 #     !bash run_kaggle.sh xp5a             # xp5a: GRU retrained without react/probehold schedules + benefit check
 #                                          #   + GRU deployment (end rule 'freeze') -> xp5a_all.zip
 #                                          #   needs xp5_all.zip attached as a dataset (Add Input) (~2 h)
+#     !bash run_kaggle.sh xp6              # xp6: data (500 runs, Krum, backdoor + label flip, alarm-driven schedules)
+#                                          #   + GRU + deployment in one session -> xp6_all.zip (~8.5 h)
+#     !bash run_kaggle.sh xp6_data         #   the same in two sessions: data -> results_xp6_data.zip + xp6_all.zip (~5.5 h)
+#     !bash run_kaggle.sh xp6_final        #   GRU + deployment; needs results_xp6_data.zip attached (~3 h)
 #     !bash run_kaggle.sh xp3_deploy       # GRU sweep on xp3 + model selection + deployment (96 runs)
 #                                          #   needs results_xp3.zip attached as a Kaggle dataset (Add Input)
 #                                          #   -> /kaggle/working/xp3_deploy.zip
@@ -30,6 +34,8 @@
 #     XP3_DATA=/path/all_blocks.csv   xp3 data for xp3_deploy (default: searched in /kaggle/input)
 #     XP5_DATA=/path/all_blocks.csv   xp5 data for xp5_final (default: searched in /kaggle/input)
 #     XP5_SMOKE=1     tiny version of the xp5 stages (30-block runs, 2 epochs): checks the pipeline end to end
+#     XP6_SMOKE=1     the same for the xp6 stages
+#     XP6_DATA=/path/all_blocks.csv   xp6 data for xp6_final (default: this session's, else /kaggle/input)
 #
 # Re-running a stage skips runs that already finished with the same config,
 # so an interrupted stage can simply be started again (same session).
@@ -39,7 +45,7 @@
 set -euo pipefail
 
 STAGE="${1:-sanity}"
-case "$STAGE" in sanity|collect|all|counterfactual|xp2|xp3|xp4|xp5_pilot|xp5_data|xp5_final|xp5a|xp3_deploy) ;; *) echo "usage: $0 [sanity|collect|all|counterfactual|xp2|xp3|xp4|xp5_pilot|xp5_data|xp5_final|xp5a|xp3_deploy]"; exit 2;; esac
+case "$STAGE" in sanity|collect|all|counterfactual|xp2|xp3|xp4|xp5_pilot|xp5_data|xp5_final|xp5a|xp6_data|xp6_final|xp6|xp3_deploy) ;; *) echo "usage: $0 [sanity|collect|all|counterfactual|xp2|xp3|xp4|xp5_pilot|xp5_data|xp5_final|xp5a|xp6_data|xp6_final|xp6|xp3_deploy]"; exit 2;; esac
 if [ -d /kaggle/working ]; then DEFAULT_WORK=/kaggle/working/testbed; else DEFAULT_WORK="$PWD/testbed"; fi
 WORK="${WORK:-$DEFAULT_WORK}"
 JOBS="${JOBS:-$(nproc)}"

@@ -186,6 +186,69 @@ PYCHECK
   xp5a_zip
 }
 
+# xp6: Krum only, backdoor (patch triggers) + targeted label flip, leak-free alarm-driven schedules.
+xp6_zip() {  # (re)write the final zip with everything produced so far
+  (cd "$WORK" && rm -f "$WORK/../xp6_all.zip" && zip -qr "$WORK/../xp6_all.zip" \
+     $(ls -d results/xp6 results/deploy_xp6 xp6_logs 2>/dev/null))
+  echo "== saved $(dirname "$WORK")/xp6_all.zip"
+}
+
+run_xp6_data() {
+  if [ "${XP6_SMOKE:-0}" = "1" ]; then SMOKE_DATA=(--seeds 40 --set n_blocks=30); else SMOKE_DATA=(); fi
+  echo "== xp6 step 1: data (400 seen + 60 twins + 40 held-out runs; Fashion-MNIST; Krum; alarm-driven schedules)"
+  "$PY" -u run_experiment.py xp6 --jobs "$JOBS" "${SMOKE_DATA[@]}" $EXTRA
+  mkdir -p results/xp6/runs_xp6
+  cp runs_xp6/all_blocks.csv results/xp6/runs_xp6/all_blocks.csv
+  (cd "$WORK" && rm -f "$WORK/../results_xp6_data.zip" && zip -qr "$WORK/../results_xp6_data.zip" runs_xp6)
+  echo "== saved $(dirname "$WORK")/results_xp6_data.zip"
+  xp6_zip
+}
+
+find_xp6_data() {
+  if [ -n "${XP6_DATA:-}" ]; then echo "$XP6_DATA"; return; fi
+  if [ -f "$WORK/results/xp6/runs_xp6/all_blocks.csv" ]; then echo "$WORK/results/xp6/runs_xp6/all_blocks.csv"; return; fi
+  local f
+  f=$(find /kaggle/input -path '*runs_xp6/all_blocks.csv' 2>/dev/null | head -1)
+  if [ -z "$f" ]; then
+    local z; z=$(find /kaggle/input \( -name 'results_xp6_data*.zip' -o -name 'xp6_all*.zip' \) 2>/dev/null | head -1)
+    if [ -n "$z" ]; then
+      unzip -qo "$z" '*runs_xp6/all_blocks.csv' -d "$WORK/xp6_unzipped" \
+        && f=$(find "$WORK/xp6_unzipped" -path '*runs_xp6/all_blocks.csv' | head -1)
+    fi
+  fi
+  echo "$f"
+}
+
+run_xp6_final() {
+  local data smoke="${XP6_SMOKE:-0}"
+  data=$(find_xp6_data)
+  if [ -z "$data" ] || [ ! -f "$data" ]; then
+    echo "xp6 data not found: run 'xp6_data' first, attach results_xp6_data.zip as a dataset, or set XP6_DATA=/path/all_blocks.csv"; exit 1
+  fi
+  mkdir -p results/xp6/runs_xp6 xp6_logs
+  [ "$data" -ef results/xp6/runs_xp6/all_blocks.csv ] || cp "$data" results/xp6/runs_xp6/all_blocks.csv
+  "$PY" - "$smoke" <<'PYCHECK'
+import sys
+import pandas as pd
+d = pd.read_csv("results/xp6/runs_xp6/all_blocks.csv", usecols=["run_id", "defense", "attack"])
+n, rows = d.run_id.nunique(), sorted(d.groupby("run_id").size().unique())
+print(f"xp6 data: {n} runs, rows per run {rows}, defenses {sorted(d.defense.unique())}, attacks {sorted(d.attack.unique())}")
+if sys.argv[1] != "1" and (n != 500 or rows != [251]):
+    raise SystemExit("unexpected xp6 data: expected 500 runs x 251 rows")
+PYCHECK
+  local ep=(); [ "$smoke" = "1" ] && ep=(--epochs 2)
+  echo "== xp6 step 2a: one GRU on all seen xp6 runs (3 candidates, selected on validation) + benefit / kill checks"
+  "$PY" -u gru_xp5.py --runs results/xp6/runs_xp6/all_blocks.csv --out results/xp6/gru "${ep[@]}" | tee xp6_logs/gru.txt
+  xp6_zip
+  local dsm=(); [ "$smoke" = "1" ] && dsm=(--smoke)
+  echo "== xp6 step 2b: deployment (10 environments incl. 2 held-out x 3 seeds x 8 policies; fixed xp5 alarm; end rule 'freeze')"
+  "$PY" -u deploy_xp5.py --experiment xp6 --jobs "$JOBS" --runs results/xp6/runs_xp6/all_blocks.csv \
+    --gru-summary results/xp6/gru/summary.json --out results/deploy_xp6 --alarm-file poison_testbed/alarm_xp5.json \
+    --end-rule freeze --title xp6 --policies clean_ref off on oracle threshold threshold_low gru gru_free \
+    "${dsm[@]}" | tee xp6_logs/deploy.txt
+  xp6_zip
+}
+
 # GRU candidates for xp3: name hidden lr weight_decay. xp1/xp2 settings (64, 2e-3, 0) overfit xp3 after 2 epochs.
 XP3_SWEEP=("a 64 5e-4 0" "b 32 5e-4 1e-3" "c 64 2e-4 1e-2" "d 128 5e-4 1e-2")
 
@@ -250,6 +313,9 @@ case "$STAGE" in
   xp5_data)       run_xp5_data ;;
   xp5_final)      run_xp5_final ;;
   xp5a)           run_xp5a ;;
+  xp6_data)       run_xp6_data ;;
+  xp6_final)      run_xp6_final ;;
+  xp6)            run_xp6_data; run_xp6_final ;;
   xp3_deploy)     run_xp3_deploy ;;
 esac
 echo "== done in $((SECONDS / 60)) min"

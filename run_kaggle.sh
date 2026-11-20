@@ -19,6 +19,10 @@
 #     !bash run_kaggle.sh xp5a             # xp5a: GRU retrained without react/probehold schedules + benefit check
 #                                          #   + GRU deployment (end rule 'freeze') -> xp5a_all.zip
 #                                          #   needs xp5_all.zip attached as a dataset (Add Input) (~2 h)
+#     !bash run_kaggle.sh xp6              # xp6: data (500 runs, Krum, backdoor + label flip, alarm-driven schedules)
+#                                          #   + GRU + deployment in one session -> xp6_all.zip (~8.5 h)
+#     !bash run_kaggle.sh xp6_data         #   the same in two sessions: data -> results_xp6_data.zip + xp6_all.zip (~5.5 h)
+#     !bash run_kaggle.sh xp6_final        #   GRU + deployment; needs results_xp6_data.zip attached (~3 h)
 #     !bash run_kaggle.sh xp3_deploy       # GRU sweep on xp3 + model selection + deployment (96 runs)
 #                                          #   needs results_xp3.zip attached as a Kaggle dataset (Add Input)
 #                                          #   -> /kaggle/working/xp3_deploy.zip
@@ -30,6 +34,8 @@
 #     XP3_DATA=/path/all_blocks.csv   xp3 data for xp3_deploy (default: searched in /kaggle/input)
 #     XP5_DATA=/path/all_blocks.csv   xp5 data for xp5_final (default: searched in /kaggle/input)
 #     XP5_SMOKE=1     tiny version of the xp5 stages (30-block runs, 2 epochs): checks the pipeline end to end
+#     XP6_SMOKE=1     the same for the xp6 stages
+#     XP6_DATA=/path/all_blocks.csv   xp6 data for xp6_final (default: this session's, else /kaggle/input)
 #
 # Re-running a stage skips runs that already finished with the same config,
 # so an interrupted stage can simply be started again (same session).
@@ -39,7 +45,7 @@
 set -euo pipefail
 
 STAGE="${1:-sanity}"
-case "$STAGE" in sanity|collect|all|counterfactual|xp2|xp3|xp4|xp5_pilot|xp5_data|xp5_final|xp5a|xp3_deploy) ;; *) echo "usage: $0 [sanity|collect|all|counterfactual|xp2|xp3|xp4|xp5_pilot|xp5_data|xp5_final|xp5a|xp3_deploy]"; exit 2;; esac
+case "$STAGE" in sanity|collect|all|counterfactual|xp2|xp3|xp4|xp5_pilot|xp5_data|xp5_final|xp5a|xp6_data|xp6_final|xp6|xp3_deploy) ;; *) echo "usage: $0 [sanity|collect|all|counterfactual|xp2|xp3|xp4|xp5_pilot|xp5_data|xp5_final|xp5a|xp6_data|xp6_final|xp6|xp3_deploy]"; exit 2;; esac
 if [ -d /kaggle/working ]; then DEFAULT_WORK=/kaggle/working/testbed; else DEFAULT_WORK="$PWD/testbed"; fi
 WORK="${WORK:-$DEFAULT_WORK}"
 JOBS="${JOBS:-$(nproc)}"
@@ -188,6 +194,84 @@ class ScheduledAggregator(Aggregator):
     @staticmethod
     def active(round: int, schedule: Sequence[int], block_len: int) -> int:
         return int(schedule[round // block_len])
+__KRUM_TESTBED_EOF__
+cat > poison_testbed/alarm.py <<'__KRUM_TESTBED_EOF__'
+"""Alarm-driven defense schedules (xp6): the defense reacts to an OBSERVABLE alarm, never to the true attack window.
+
+Why (xp5a): schedules that switch the defense on at the true window start ('react', 'probehold') make a planned
+W = 1 announce an attack, and an outcome model fed with the planned W learns 'W = 1 -> high attack success'. Here
+W depends only on what a defender sees (the signals and its own past W), as at deployment.
+
+Alarm score of a block = max of two z-scores, each against no-attack training blocks of the same defense, defense
+state W and 25-block time bin: x_norm_std (v1) and x2_outlier_proj_max_max (v2). The z tables are the xp5 alarm
+(deploy_xp5.fit_alarm on xp5 training runs, file alarm_xp5.json), fixed before any xp6 run.
+
+Schedule "alarm_t<tau>_d<delay>_h<hold>":
+    an alarm is a block with score > tau; the defense switches on `delay` blocks after an alarm seen while off,
+    then stays on until `hold` consecutive blocks without an alarm (at least `hold` blocks).
+"""
+
+import json
+import math
+import re
+from functools import lru_cache
+from pathlib import Path
+from typing import Any
+
+ALARM_FILE = Path(__file__).with_name("alarm_xp5.json")
+ALARM_SCHEDULE = re.compile(r"alarm_t([0-9.]+)_d(\d+)_h(\d+)")
+V1, V2, BIN = "x_norm_std", "x2_outlier_proj_max_max", 25
+
+
+@lru_cache(maxsize=None)
+def load_alarm(path: str = str(ALARM_FILE)) -> dict:
+    """{'table': {'<defense>|<W>|<bin>': [mean_v1, sd_v1, mean_v2, sd_v2]}, 'threshold': float}."""
+    return json.loads(Path(path).read_text())
+
+
+def score(row: dict[str, Any], table: dict) -> float:
+    """Alarm score of one observed block row (-inf when it cannot be scored: init row, missing signal or bin)."""
+    if row.get("block", -1) < 0:
+        return -math.inf
+    w = row.get("W")
+    if w is None or (isinstance(w, float) and math.isnan(w)):
+        return -math.inf
+    stats = table.get(f"{row['defense']}|{int(w)}|{int(row['block']) // BIN}")
+    v1, v2 = row.get(V1), row.get(V2)
+    if stats is None or v1 is None or v2 is None or not (math.isfinite(v1) and math.isfinite(v2)):
+        return -math.inf
+    m1, s1, m2, s2 = stats
+    return max((v1 - m1) / max(s1, 1e-9), (v2 - m2) / max(s2, 1e-9))
+
+
+class AlarmSchedule:
+    """Online policy(history, b) -> (W_b, extra) for simulate(); history = observable rows of blocks -1..b-1."""
+
+    def __init__(self, tau: float, delay: int, hold: int, table: dict):
+        self.tau, self.delay, self.hold, self.table = tau, delay, hold, table
+        self.on, self.pending, self.quiet = False, None, 0
+
+    def __call__(self, history: list[dict[str, Any]], b: int) -> tuple[int, dict[str, Any]]:
+        hit = score(history[-1], self.table) > self.tau
+        self.quiet = 0 if hit else self.quiet + 1
+        if hit and not self.on and self.pending is None:
+            self.pending = b + self.delay
+        if self.pending is not None and b >= self.pending:
+            self.on, self.pending, self.quiet = True, None, 0
+        elif self.on and self.quiet >= self.hold:
+            self.on = False
+        return int(self.on), {}
+
+
+def is_alarm_schedule(schedule: str) -> bool:
+    return ALARM_SCHEDULE.fullmatch(schedule) is not None
+
+
+def alarm_policy(schedule: str) -> AlarmSchedule:
+    m = ALARM_SCHEDULE.fullmatch(schedule)
+    if m is None:
+        raise ValueError(f"not an alarm schedule: {schedule!r}")
+    return AlarmSchedule(float(m.group(1)), int(m.group(2)), int(m.group(3)), load_alarm()["table"])
 __KRUM_TESTBED_EOF__
 cat > poison_testbed/data.py <<'__KRUM_TESTBED_EOF__'
 """MNIST as preloaded, normalised tensors, plus a clean val split and a triggered test set."""
@@ -468,6 +552,7 @@ from krum.primitives.aggregators.trimmed_mean import TrimmedMean
 from krum.primitives.models.mlp import Krum2017MLPMnist
 
 from .aggregators import ClipNoise
+from .alarm import alarm_policy, is_alarm_schedule
 from .data import load_data, load_mnist, make_trigger
 from .poisoning import make_attack
 from .signals import X2_COLUMNS, X_COLUMNS
@@ -505,6 +590,7 @@ class RunConfig:
     sigma: float
     # "random" | "on" | "off" | "policy" | "cf_<on|off|ontil20|offtil20|alt>_p<prefix>"
     # | "sticky_p<switch prob>" | "react_d<delay>_e<extra>" (blocks, relative to `window`)
+    # | "alarm_t<tau>_d<delay>_h<hold>" (xp6: online, reacts to the observable alarm; see alarm.py)
     schedule: str = "random"
     schedule_seed: int | None = None  # default: 1000 + seed
     n: int = 16
@@ -602,6 +688,8 @@ def make_schedule(cfg: RunConfig) -> list[int]:
     if m := FLIP_SUFFIX.fullmatch(cfg.schedule):
         # Paired twin: the base schedule with W flipped on blocks [s, s + l). Same seed, so the pair gives the
         # true effect of that short change.
+        if is_alarm_schedule(m.group(1)):
+            raise ValueError("twins of alarm schedules are not defined (their W is decided online)")
         base = make_schedule(replace(cfg, schedule=m.group(1)))
         s, ln = int(m.group(2)), int(m.group(3))
         return [1 - w if s <= b < s + ln else w for b, w in enumerate(base)]
@@ -621,7 +709,7 @@ def make_schedule(cfg: RunConfig) -> list[int]:
     if cfg.schedule == "random":
         gen = torch.Generator().manual_seed(cfg.sched_seed)
         return torch.bernoulli(torch.full((cfg.n_blocks,), 0.5), generator=gen).int().tolist()
-    if cfg.schedule == "policy":
+    if cfg.schedule == "policy" or is_alarm_schedule(cfg.schedule):
         return [0] * cfg.n_blocks  # placeholder: each entry is set online by the policy before its block runs
     if cfg.schedule == "oracle":
         # Defend exactly the blocks where the attack is active (knows the attack: an upper reference only).
@@ -722,6 +810,8 @@ def simulate(cfg: RunConfig, policy: Policy | None = None) -> pd.DataFrame:
     ``policy(history, b) -> (W_b, extra)``, if given, decides W for block b before it runs. ``history`` holds the
     observable part of rows -1..b-1 only (see ``observable``). ``extra`` is logged on block b's row.
     """
+    if policy is None and is_alarm_schedule(cfg.schedule):  # xp6: W decided online from the observable alarm
+        policy = alarm_policy(cfg.schedule)
     sim = build(cfg)
     base = {"run_id": cfg.run_id, "seed": cfg.seed, "schedule_seed": cfg.sched_seed, "defense": cfg.defense,
             "attack": cfg.attack, "poison_frac": cfg.poison_frac, "n": cfg.n, "f": cfg.f}
@@ -785,7 +875,7 @@ def run(cfg: RunConfig, out_root: Path) -> tuple[pd.DataFrame, dict[str, Any]]:
         "run_id": cfg.run_id,
         "config_hash": cfg.hash(),
         "config": asdict(cfg),
-        "schedule": make_schedule(cfg),
+        "schedule": ([int(w) for w in df.W.iloc[1:]] if is_alarm_schedule(cfg.schedule) else make_schedule(cfg)),
         "testbed_version": TESTBED_VERSION,
         "krum_version": krum.__version__,
         "krum_git_commit": _git_commit(),
@@ -1113,6 +1203,372 @@ class PoisoningSimulation(KrumSimulation):
         self._model.module.eval()
         return (self._model.module(x).argmax(1) == target).float().mean().item()
 __KRUM_TESTBED_EOF__
+cat > poison_testbed/alarm_xp5.json <<'__KRUM_TESTBED_EOF__'
+{
+  "table": {
+    "Krum|0|0": [
+      1.1015771619487005,
+      0.3318699391984155,
+      0.3835146198706703,
+      0.08525284456864657
+    ],
+    "Krum|0|1": [
+      1.3179936566590014,
+      0.20797402614048305,
+      0.42363882148530646,
+      0.0970878092544112
+    ],
+    "Krum|0|2": [
+      1.4043845151967191,
+      0.21602638306057914,
+      0.4200633997778974,
+      0.08569862368174916
+    ],
+    "Krum|0|3": [
+      1.3983255331914355,
+      0.2288822278772429,
+      0.40283526314246404,
+      0.083721248624204
+    ],
+    "Krum|0|4": [
+      1.447428570739154,
+      0.21931049801943636,
+      0.38758791997951986,
+      0.0897925671539122
+    ],
+    "Krum|0|5": [
+      1.4179208129340908,
+      0.2073345776508322,
+      0.375543221411278,
+      0.08302290547043024
+    ],
+    "Krum|0|6": [
+      1.4390529814002277,
+      0.21765265794371355,
+      0.37315694614126427,
+      0.07807401703116833
+    ],
+    "Krum|0|7": [
+      1.5199424690972156,
+      0.25555246019105265,
+      0.3816637809794388,
+      0.0825775389776683
+    ],
+    "Krum|0|8": [
+      1.4568272678911005,
+      0.2030159446556096,
+      0.361724912956281,
+      0.0874335988009331
+    ],
+    "Krum|0|9": [
+      1.4976450302384117,
+      0.2164947525899538,
+      0.35646598332730206,
+      0.0826243383141555
+    ],
+    "Krum|1|0": [
+      1.3390252077776306,
+      0.35197641883578185,
+      0.40993346582966844,
+      0.08994498230011838
+    ],
+    "Krum|1|1": [
+      1.6462252682672356,
+      0.2957475924095794,
+      0.47727469803245903,
+      0.10247518066408162
+    ],
+    "Krum|1|2": [
+      1.8129014010014741,
+      0.335913485832129,
+      0.4706475046551107,
+      0.09453209718977687
+    ],
+    "Krum|1|3": [
+      1.8098570771123235,
+      0.3795284337412491,
+      0.4724248212061273,
+      0.09738942797638062
+    ],
+    "Krum|1|4": [
+      1.74015707757649,
+      0.3688015912287967,
+      0.4324233832469346,
+      0.0909105329442657
+    ],
+    "Krum|1|5": [
+      2.0104372842174967,
+      0.4081483441576622,
+      0.48243302249072834,
+      0.10783440620284944
+    ],
+    "Krum|1|6": [
+      2.0787151645640938,
+      0.42668043460761884,
+      0.4699462604481336,
+      0.10610681918902959
+    ],
+    "Krum|1|7": [
+      2.1135585237280163,
+      0.4840790263696761,
+      0.4827811552730577,
+      0.10387810544007092
+    ],
+    "Krum|1|8": [
+      2.0707756174706864,
+      0.5453939660880824,
+      0.4721471583152565,
+      0.12091165418212488
+    ],
+    "Krum|1|9": [
+      2.158062409918483,
+      0.5330229352924962,
+      0.4438291048904793,
+      0.10224569261292239
+    ],
+    "Median|0|0": [
+      1.0892414290207524,
+      0.3305604616602914,
+      0.38340722853610093,
+      0.09883048778105326
+    ],
+    "Median|0|1": [
+      1.330863632403092,
+      0.23364918452040243,
+      0.42500853770608255,
+      0.09326926718368793
+    ],
+    "Median|0|2": [
+      1.4772621151599161,
+      0.2693614610420511,
+      0.42666445404604286,
+      0.09690156638166617
+    ],
+    "Median|0|3": [
+      1.4753460177551891,
+      0.25692606737423196,
+      0.43653398126940113,
+      0.09330810246633525
+    ],
+    "Median|0|4": [
+      1.5234489096102313,
+      0.2676149801235245,
+      0.41959396945476973,
+      0.09568828081237744
+    ],
+    "Median|0|5": [
+      1.5169314767866697,
+      0.30758089181678233,
+      0.4133499764314013,
+      0.09411472680493736
+    ],
+    "Median|0|6": [
+      1.5700718515638739,
+      0.3064438381034083,
+      0.4227229159592262,
+      0.0912438136544927
+    ],
+    "Median|0|7": [
+      1.5797154572485865,
+      0.286695631672056,
+      0.3884755731554468,
+      0.09521878838840682
+    ],
+    "Median|0|8": [
+      1.547576598483737,
+      0.25134157136150276,
+      0.4020565004961615,
+      0.08876962052296987
+    ],
+    "Median|0|9": [
+      1.5396795246270623,
+      0.24819642138032433,
+      0.37757887728818657,
+      0.09639722428685335
+    ],
+    "Median|1|0": [
+      1.214823070580938,
+      0.3697308497484428,
+      0.43499473089394897,
+      0.10241915753514502
+    ],
+    "Median|1|1": [
+      1.578506095531844,
+      0.3255387607918323,
+      0.4973386723036907,
+      0.09744510560604876
+    ],
+    "Median|1|2": [
+      1.692631262232108,
+      0.3442151868437422,
+      0.510353824746103,
+      0.09844441777824735
+    ],
+    "Median|1|3": [
+      1.7320775500776475,
+      0.3860146427296427,
+      0.5074653390240061,
+      0.10994752940769881
+    ],
+    "Median|1|4": [
+      1.7137623021096895,
+      0.32992735026613174,
+      0.5094385157633257,
+      0.11263380756979034
+    ],
+    "Median|1|5": [
+      1.8188680370824526,
+      0.38370549559668293,
+      0.5020559795860293,
+      0.11621855832513267
+    ],
+    "Median|1|6": [
+      1.8377923604434099,
+      0.41880261507307553,
+      0.5015703260299502,
+      0.11330513677057541
+    ],
+    "Median|1|7": [
+      1.9893040252304495,
+      0.45296827073776363,
+      0.5121789256862347,
+      0.10347951541268366
+    ],
+    "Median|1|8": [
+      2.064509329123375,
+      0.4563089012307903,
+      0.5325849314055107,
+      0.1086617386464153
+    ],
+    "Median|1|9": [
+      2.228984110477643,
+      0.5985244643001986,
+      0.5398856706896803,
+      0.11348817866001674
+    ],
+    "TrimmedMean|0|0": [
+      1.0923510171291304,
+      0.3266242458960273,
+      0.3936254901153529,
+      0.09498497838676624
+    ],
+    "TrimmedMean|0|1": [
+      1.3653343923833987,
+      0.22156761327330113,
+      0.419097636577886,
+      0.08002745051525088
+    ],
+    "TrimmedMean|0|2": [
+      1.439031767115301,
+      0.22731132422168196,
+      0.4126970183885376,
+      0.09592729231963945
+    ],
+    "TrimmedMean|0|3": [
+      1.4850424070476378,
+      0.24341149423288955,
+      0.4233366438403586,
+      0.08306897633629465
+    ],
+    "TrimmedMean|0|4": [
+      1.539737791667894,
+      0.22357738109486236,
+      0.39269430115092946,
+      0.09262735946050554
+    ],
+    "TrimmedMean|0|5": [
+      1.5137767128666566,
+      0.21842261402379654,
+      0.39566547739480823,
+      0.08772363366441153
+    ],
+    "TrimmedMean|0|6": [
+      1.5309460344059127,
+      0.23283935023353644,
+      0.37425843548491916,
+      0.07925233838773202
+    ],
+    "TrimmedMean|0|7": [
+      1.558119035280984,
+      0.23898984792955938,
+      0.4014785217696552,
+      0.09488490033298266
+    ],
+    "TrimmedMean|0|8": [
+      1.5804933177870373,
+      0.2557823646839122,
+      0.41065401215025493,
+      0.08910637955130195
+    ],
+    "TrimmedMean|0|9": [
+      1.6028888726288133,
+      0.2446527543530438,
+      0.38800307145715035,
+      0.0911335580481228
+    ],
+    "TrimmedMean|1|0": [
+      1.2375851151735886,
+      0.31196803505578813,
+      0.39688432431138776,
+      0.10632336618352281
+    ],
+    "TrimmedMean|1|1": [
+      1.4813237514998345,
+      0.2654017496025436,
+      0.47330626122081254,
+      0.09390099997837455
+    ],
+    "TrimmedMean|1|2": [
+      1.5771030889025757,
+      0.2689200064519562,
+      0.4606832957408379,
+      0.10255605933033055
+    ],
+    "TrimmedMean|1|3": [
+      1.6706566146694788,
+      0.2967994428712495,
+      0.47565368859115464,
+      0.09789799586028115
+    ],
+    "TrimmedMean|1|4": [
+      1.673899861147804,
+      0.2895629663561853,
+      0.47034344573132664,
+      0.10752998757554376
+    ],
+    "TrimmedMean|1|5": [
+      1.7066743639417183,
+      0.29304681179950903,
+      0.46226980114478705,
+      0.09268502690711229
+    ],
+    "TrimmedMean|1|6": [
+      1.771944181786643,
+      0.3117378208978934,
+      0.4544036216573059,
+      0.09334962301556946
+    ],
+    "TrimmedMean|1|7": [
+      1.8351188797900018,
+      0.3226085044248937,
+      0.4275918246760325,
+      0.08855698648951225
+    ],
+    "TrimmedMean|1|8": [
+      1.8284528786721437,
+      0.32739878908445375,
+      0.4439941513495488,
+      0.10498624006482536
+    ],
+    "TrimmedMean|1|9": [
+      1.850753178934992,
+      0.36261747810176875,
+      0.4368549833249486,
+      0.08387293105594945
+    ]
+  },
+  "threshold": 3.666642462644976
+}__KRUM_TESTBED_EOF__
 cat > run_experiment.py <<'__KRUM_TESTBED_EOF__'
 """Data-poisoning testbed experiments.
 
@@ -1479,6 +1935,104 @@ def xp5_configs(overrides: dict) -> list[RunConfig]:
     return main + paired_twins(main, 81_000, XP5_TWINS) + heldout
 
 
+# xp6 = xp5's Fashion-MNIST setting, Krum only, backdoor (patch triggers) and targeted label flip only (no ALIE).
+# xp5a showed that 'react' / 'probehold' schedules (defense on at the TRUE window) leak the attack to the outcome
+# model through the planned W. xp6 has no such schedule: 'alarm' schedules react to the observable alarm
+# (poison_testbed/alarm.py; tau 2.0 catches 2/8 onsets within ~1 block on the xp5 Krum logs, ~12 alarm onsets per
+# no-attack run; tau 3.67 is the xp5 deployment alarm), and every other schedule ignores the window. Twins flip W
+# on 10-40 blocks starting at a uniformly drawn block (never placed relative to the run's own window).
+XP6_MAIN, XP6_TWINS, XP6_HELDOUT = 400, 60, 40
+XP6_SEED0, XP6_HELDOUT_SEED0 = 40_000, 41_000
+XP6_FAMILIES = {"none": 0.20, "backdoor": 0.45, "burst": 0.10, "flip": 0.25}
+XP6_BACKDOOR_PF = {0.125: 0.35, 0.25: 0.40, 1.0: 0.25}  # weight on the stealthy rates (the open problem)
+XP6_SCHEDULES = {"alarm": 0.45, "sticky": 0.20, "probe": 0.10, "on": 0.10, "off": 0.15}
+XP6_ALARM_TAU = [2.0, 2.5, 3.0, 3.67]
+XP6_ALARM_DELAY = [0, 1, 2, 5, 10, 20]  # blocks after the alarm: 20 = too late for 2/8 (negative examples)
+XP6_ALARM_HOLD = [5, 10, 20, 40]
+XP6_TWIN_LEN = [10, 20, 40]
+XP6_HELDOUT_GROUPS = ["blend trigger", "poison rate 3/8"]
+
+
+def xp6_schedule(rng: np.random.Generator) -> str:
+    family = rng.choice(list(XP6_SCHEDULES), p=list(XP6_SCHEDULES.values()))
+    if family == "alarm":
+        return (f"alarm_t{rng.choice(XP6_ALARM_TAU)}_d{rng.choice(XP6_ALARM_DELAY)}"
+                f"_h{rng.choice(XP6_ALARM_HOLD)}")
+    if family == "sticky":
+        return f"sticky_p{rng.choice(XP3_STICKY_P)}"
+    if family == "probe":
+        period, length = int(rng.choice(XP3_PROBE_PERIOD)), int(rng.choice(XP3_PROBE_LEN))
+        length = min(length, period - 1)
+        return f"probe_P{period}_L{length}_o{int(rng.integers(0, period))}"
+    return str(family)
+
+
+def xp6_main_config(i: int, overrides: dict) -> RunConfig:
+    rng = np.random.default_rng(100_000 + i)
+    family = rng.choice(list(XP6_FAMILIES), p=list(XP6_FAMILIES.values()))
+    target = int(rng.choice(XP5_TARGETS))
+    window = _xp5_window(rng)
+    fields: dict = {"target": target}
+    if family == "none":
+        fields.update(attack="none", trigger=str(rng.choice(XP5_TRIGGERS)))  # trigger: base-rate measurement only
+    elif family == "backdoor":
+        fields.update(attack="backdoor_win", trigger=str(rng.choice(XP5_TRIGGERS)),
+                      poison_frac=float(rng.choice(list(XP6_BACKDOOR_PF), p=list(XP6_BACKDOOR_PF.values()))))
+    elif family == "burst":
+        fields.update(attack="backdoor_burst", trigger=str(rng.choice(XP5_TRIGGERS)),
+                      poison_frac=float(rng.choice([0.25, 1.0])),
+                      burst=tuple(int(v) for v in XP5_BURSTS[int(rng.integers(len(XP5_BURSTS)))]))
+    else:
+        fields.update(attack="flip_win", poison_frac=float(rng.choice([0.25, 1.0])),
+                      flip_source=int(rng.choice(XP5_FLIP_SOURCES)))
+    return RunConfig(defense="Krum", seed=XP6_SEED0 + i, schedule=xp6_schedule(rng), window=window,
+                     **fields, **xp5_params(overrides))
+
+
+def xp6_heldout_config(j: int, overrides: dict) -> RunConfig:
+    rng = np.random.default_rng(102_000 + j)
+    group = XP6_HELDOUT_GROUPS[j % len(XP6_HELDOUT_GROUPS)]
+    target = int(rng.choice(XP5_TARGETS))
+    window = _xp5_window(rng)
+    if group == "blend trigger":
+        fields = dict(attack="backdoor_win", trigger="blend", poison_frac=float(rng.choice([0.25, 1.0])))
+    else:
+        fields = dict(attack="backdoor_win", trigger=str(rng.choice(XP5_TRIGGERS)), poison_frac=0.375)
+    return RunConfig(defense="Krum", seed=XP6_HELDOUT_SEED0 + j, schedule=xp6_schedule(rng), window=window,
+                     target=target, **fields, **xp5_params(overrides))
+
+
+def xp6_twins(main: list[RunConfig]) -> list[RunConfig]:
+    """Twins = main runs (non-alarm schedules) with W flipped on [s, s + l): s uniform over the run, independent
+    of the run's window (no leak), l in 10-40 blocks. Same seed and data: the true effect of a long change."""
+    rng = np.random.default_rng(101_000)
+    pool = [k for k, c in enumerate(main) if not c.schedule.startswith("alarm")]
+    twins = []
+    for k in sorted(rng.choice(pool, XP6_TWINS, replace=False)):
+        base = main[k]
+        n = base.n_blocks
+        ln = int(rng.choice(XP6_TWIN_LEN))
+        s = int(rng.integers(0, max(1, n - ln)))
+        twins.append(RunConfig(**{**base.__dict__, "schedule": f"{base.schedule}+flip_s{s}_l{min(ln, n - s)}"}))
+    return twins
+
+
+def xp6_configs(overrides: dict) -> list[RunConfig]:
+    """400 main runs + 60 paired twins (seen) + 40 held-out runs = 500, all Krum."""
+    main = [xp6_main_config(i, overrides) for i in range(XP6_MAIN)]
+    heldout = [xp6_heldout_config(j, overrides) for j in range(XP6_HELDOUT)]
+    return main + xp6_twins(main) + heldout
+
+
+def cmd_xp6(args: argparse.Namespace) -> None:
+    """xp6 data: Fashion-MNIST, Krum only, backdoor + targeted flip, alarm-driven (leak-free) schedules."""
+    configs = xp6_configs(parse_overrides(args.set))
+    if args.seeds:  # smoke tests: a spread of runs (every k-th), so every family and the held-out set appear
+        step = max(1, len(configs) // args.seeds)
+        configs = configs[::step][: args.seeds]
+    execute(configs, ROOT / (args.out or "runs_xp6"), args.jobs)
+
+
 def cmd_xp5(args: argparse.Namespace) -> None:
     """xp5 data: Fashion-MNIST, backdoor variants / bursts / targeted flip / ALIE, Krum / Median / TrimmedMean."""
     configs = xp5_configs(parse_overrides(args.set))
@@ -1548,7 +2102,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = parser.add_subparsers(dest="cmd", required=True)
     for name, fn in [("calibrate", cmd_calibrate), ("sanity", cmd_sanity), ("collect", cmd_collect),
-                     ("counterfactual", cmd_counterfactual), ("xp2", cmd_xp2), ("xp3", cmd_xp3), ("xp4", cmd_xp4), ("xp5", cmd_xp5),
+                     ("counterfactual", cmd_counterfactual), ("xp2", cmd_xp2), ("xp3", cmd_xp3), ("xp4", cmd_xp4), ("xp5", cmd_xp5), ("xp6", cmd_xp6),
                      ("report", cmd_report)]:
         sp = sub.add_parser(name)
         sp.set_defaults(fn=fn)
@@ -1721,6 +2275,29 @@ def test_xp5_attacks_and_outcomes():
     # the attack never shifts the honest data stream: identical signals before the window
     none = simulate(RunConfig(attack="none", **common))
     assert none.x_norm_std.iloc[1] == flip.x_norm_std.iloc[1]
+
+
+def test_alarm_schedule_state_machine():
+    from poison_testbed.alarm import AlarmSchedule
+    table = {f"Krum|{w}|0": [0.0, 1.0, 0.0, 1.0] for w in (0, 1)}  # z = the raw values
+    z = [0, 3, 0, 0, 0, 0, 0, 3, 0, 0, 0, 0]  # alarms (tau 2) at blocks 1 and 7
+    pol, hist, w = AlarmSchedule(tau=2.0, delay=2, hold=3, table=table), [{"block": -1, "W": None}], []
+    for b in range(len(z)):
+        wb, _ = pol(hist, b)
+        w.append(wb)
+        hist.append({"block": b, "W": wb, "defense": "Krum", "x_norm_std": float(z[b]),
+                     "x2_outlier_proj_max_max": -9.0})
+    # alarm seen after block 1 -> on from block 2 + 2 = 4, held 3 quiet blocks; block 7's alarm -> on from 10
+    assert w == [0, 0, 0, 0, 1, 1, 1, 0, 0, 0, 1, 1]
+
+
+def test_alarm_schedule_ignores_the_true_window():
+    common = dict(attack="none", defense="Krum", seed=5, schedule="alarm_t2.0_d0_h5", dataset="fmnist",
+                  signals="v2", extended_log=True, C=3.0, sigma=0.01, n_blocks=6, block_len=2)
+    a = simulate(RunConfig(window=(1, 3), **common))
+    b = simulate(RunConfig(window=(4, 5), **common))
+    assert a.W.tolist() == b.W.tolist()  # no attack: the window is a phantom; W depends only on what is observed
+    assert simulate(RunConfig(window=(1, 3), **common)).equals(a)  # reproducible
 __KRUM_TESTBED_EOF__
 cat > analyze.py <<'__KRUM_TESTBED_EOF__'
 """Step 4: causal analysis of the randomized-defense logs.
@@ -3467,7 +4044,7 @@ def groups_of(df: pd.DataFrame) -> pd.Series:
     return df.run_id.map(g)
 
 
-SCHEDULE_FAMILIES = ("sticky", "react", "probehold", "probe", "on", "off")
+SCHEDULE_FAMILIES = ("sticky", "react", "probehold", "probe", "on", "off", "alarm")
 
 
 def schedule_family(run_id: pd.Series) -> pd.Series:
@@ -3576,7 +4153,7 @@ def fig_errors(table: pd.DataFrame, out: Path) -> None:
         if held:
             ax.axvspan(min(held) - 0.5, max(held) + 0.5, color=INK2, alpha=0.07, linewidth=0)
     axes[0].legend(fontsize=8)
-    fig.suptitle("xp5: one GRU for all configurations: error on seen test runs (by family) and on held-out "
+    fig.suptitle("One GRU for all configurations: error on seen test runs (by family) and on held-out "
                  "configurations (shaded)", fontsize=10, color=INK, x=0.01, ha="left")
     fig.tight_layout(rect=(0, 0, 1, 0.93))
     fig.savefig(out / "prediction_error.png", dpi=130)
@@ -3764,28 +4341,52 @@ ENVIRONMENTS = {  # name -> (RunConfig fields, defense, held out?)
     "corner 3/8 | TrimmedMean (held-out)": (dict(attack="backdoor_win", poison_frac=0.375), "TrimmedMean", True),
     "flip 8/8 | TrimmedMean (held-out)": (dict(attack="flip_win", poison_frac=1.0), "TrimmedMean", True),
 }
+# xp6 (--experiment xp6): Krum only, backdoor (patch triggers) and targeted label flip; held out: blend, 3/8.
+ENVIRONMENTS_XP6 = {
+    "backdoor corner 1/8 | Krum": (dict(attack="backdoor_win", poison_frac=0.125), "Krum", False),
+    "backdoor corner 2/8 | Krum": (dict(attack="backdoor_win", poison_frac=0.25), "Krum", False),
+    "backdoor patch 2/8 | Krum": (dict(attack="backdoor_win", poison_frac=0.25, trigger="patch_r3_c5"), "Krum", False),
+    "backdoor patch 8/8 | Krum": (dict(attack="backdoor_win", poison_frac=1.0, trigger="patch_r3_c5"), "Krum", False),
+    "burst corner 8/8 | Krum": (dict(attack="backdoor_burst", poison_frac=1.0, burst=(10, 5)), "Krum", False),
+    "flip 2/8 | Krum": (dict(attack="flip_win", poison_frac=0.25), "Krum", False),
+    "flip 8/8 | Krum": (dict(attack="flip_win", poison_frac=1.0), "Krum", False),
+    "no attack | Krum": (dict(attack="none"), "Krum", False),
+    "blend 2/8 | Krum (held-out)": (dict(attack="backdoor_win", poison_frac=0.25, trigger="blend"), "Krum", True),
+    "corner 3/8 | Krum (held-out)": (dict(attack="backdoor_win", poison_frac=0.375), "Krum", True),
+}
+EXPERIMENTS = {"xp5": (ENVIRONMENTS, 8000), "xp6": (ENVIRONMENTS_XP6, 9000)}  # environments, first seed
+SEED0 = 8000
 SEEDS_PER_ENV = 3
 POLICIES = ["clean_ref", "off", "on", "oracle", "threshold", "gru", "gru_free"]
+EXTRA_POLICIES = ["threshold_low"]  # xp6: the same alarm with a low threshold (catches 2/8 onsets, many alarms)
+LOW_TAU = 2.0
 COMPARED = {"gru": "gru_xp5", "gru_free": "gru_free_xp5"}  # earlier deployment's GRU runs (--compare)
-ALL_POLICIES = POLICIES + list(COMPARED.values())
-NON_GRU = ["clean_ref", "off", "on", "oracle", "threshold"]
+ALL_POLICIES = POLICIES + EXTRA_POLICIES + list(COMPARED.values())
+NON_GRU = ["clean_ref", "off", "on", "oracle", "threshold", "threshold_low"]
 V1, V2, BIN, HOLD, HORIZON, LAMBDA = "x_norm_std", "x2_outlier_proj_max_max", 25, 20, 20, 1.0
+
+
+def use_experiment(name: str) -> None:
+    """Select the environment set (module globals, so that spawned workers can be switched too)."""
+    global ENVIRONMENTS, SEED0
+    ENVIRONMENTS, SEED0 = EXPERIMENTS[name]
 TITLE = "xp5"  # figure titles (main: --title)
 
 POLICY_COLOR = {"clean_ref": "#52514e", "off": "#1baf7a", "on": "#eb6834", "oracle": "#e87ba4",
-                "threshold": "#008300", "gru": "#2a78d6", "gru_free": "#104281",
+                "threshold": "#008300", "threshold_low": "#a0c93f", "gru": "#2a78d6", "gru_free": "#104281",
                 "gru_xp5": "#9ec2ee", "gru_free_xp5": "#8a94a6"}
 POLICY_LABEL = {"clean_ref": "no-attack reference", "off": "always off", "on": "always on",
                 "oracle": "oracle (defends exactly the attack)", "threshold": "threshold defender (old OR new signal)",
+                "threshold_low": f"threshold defender, low threshold (z > {LOW_TAU})",
                 "gru": "GRU (alarm on, GRU decides release)", "gru_free": "GRU alone",
                 "gru_xp5": "xp5 GRU (alarm on, GRU decides release)", "gru_free_xp5": "xp5 GRU alone"}
-SHORT = {"oracle": "oracle", "threshold": "threshold", "gru": "GRU", "gru_free": "GRU alone",
+SHORT = {"oracle": "oracle", "threshold": "threshold", "threshold_low": "low threshold", "gru": "GRU", "gru_free": "GRU alone",
          "gru_xp5": "xp5 GRU", "gru_free_xp5": "xp5 GRU alone"}
-DRAW_ORDER = ["clean_ref", "off", "on", "oracle", "threshold", "gru_free_xp5", "gru_xp5", "gru_free", "gru"]
+DRAW_ORDER = ["clean_ref", "off", "on", "oracle", "threshold", "threshold_low", "gru_free_xp5", "gru_xp5", "gru_free", "gru"]
 
 
 def environment(env: str, k: int, smoke: bool = False) -> tuple[int, tuple[int, int]]:
-    seed = 8000 + 100 * list(ENVIRONMENTS).index(env) + k
+    seed = SEED0 + 100 * list(ENVIRONMENTS).index(env) + k
     if smoke:
         return seed, (5, 20)
     rng = np.random.default_rng(90_000 + seed)
@@ -3939,7 +4540,7 @@ def expected_meta(env: str, policy: str, k: int, ctx: dict) -> dict:
     """What a finished run's config.json must match to be kept (or reused) instead of run again."""
     cfg = config(env, policy, k, ctx["smoke"])
     meta = {"config": json.loads(json.dumps(cfg.__dict__, default=str))}
-    if policy in ("threshold", "gru"):
+    if policy in ("threshold", "threshold_low", "gru"):
         meta["alarm_threshold"] = ctx["alarm"]["threshold"]
     if policy.startswith("gru"):
         meta["gru_weights_sha256"] = hashlib.sha256((Path(ctx["gru_folder"]) / "gru.pt").read_bytes()).hexdigest()[:16]
@@ -3957,6 +4558,7 @@ def matches(folder: Path, meta: dict) -> bool:
 
 
 def run_one(env: str, policy: str, k: int, ctx: dict, out_root: str) -> tuple[str, float]:
+    use_experiment(ctx.get("experiment", "xp5"))  # spawned workers start from the module defaults
     smoke = ctx["smoke"]
     cfg = config(env, policy, k, smoke)
     run_id = run_id_of(env, policy, k, smoke)
@@ -3967,6 +4569,7 @@ def run_one(env: str, policy: str, k: int, ctx: dict, out_root: str) -> tuple[st
     rule = ctx["end_rule"]
     scorer = lambda: GRUScorer(folder, ctx["stats"], cfg.device, cfg.n_blocks)  # noqa: E731
     controller = {"threshold": lambda: Threshold(ctx["alarm"]),
+                  "threshold_low": lambda: Threshold({**ctx["alarm"], "threshold": LOW_TAU}),
                   "gru": lambda: GRURelease(scorer(), ctx["alarm"], ctx["margins"]["release_defended"]["delta"], rule),
                   "gru_free": lambda: GRUFree(scorer(), ctx["margins"]["release_all"]["delta"], rule),
                   }.get(policy, lambda: None)()
@@ -4042,7 +4645,8 @@ def fig_environment(blocks: pd.DataFrame, env: str, out: Path) -> None:
     g["harm"] = (ref.reindex(list(zip(g.seed, g.block))).to_numpy() - g.y_clean_acc) if is_alie else g.y_atk
     seeds = sorted(g.seed.unique())
     present = [p for p in DRAW_ORDER if p in set(g.policy) and not (p == "clean_ref" and not is_alie)]
-    deciders = [p for p in ["gru", "gru_free", "gru_xp5", "gru_free_xp5", "threshold", "oracle"] if p in present]
+    deciders = [p for p in ["gru", "gru_free", "gru_xp5", "gru_free_xp5", "threshold", "threshold_low", "oracle"]
+                if p in present]
     fig, axes = plt.subplots(3, len(seeds), figsize=(3.9 * len(seeds) + 0.6, 8.6), sharex=True, squeeze=False,
                              gridspec_kw={"height_ratios": [1, 1, 0.6]})
     no_attack = g.attack.eq("none").all() and not is_alie
@@ -4177,7 +4781,10 @@ def main() -> None:
     ap.add_argument("--out", type=Path, default=OUT)
     ap.add_argument("--report-only", action="store_true")
     ap.add_argument("--smoke", action="store_true", help="30 blocks, 1 seed, 2 environments")
-    ap.add_argument("--policies", nargs="*", default=POLICIES, choices=POLICIES)
+    ap.add_argument("--policies", nargs="*", default=POLICIES, choices=POLICIES + EXTRA_POLICIES)
+    ap.add_argument("--experiment", choices=list(EXPERIMENTS), default="xp5", help="environment set")
+    ap.add_argument("--alarm-file", type=Path, default=None,
+                    help="fixed alarm (z tables + threshold) instead of fitting it on the training runs (xp6)")
     ap.add_argument("--end-rule", choices=["shrink", "freeze"], default="shrink")
     ap.add_argument("--reuse", type=Path, default=None, help="earlier deployment folder: reuse its non-GRU runs")
     ap.add_argument("--compare", type=Path, default=None, help="earlier deployment folder: show its GRU runs")
@@ -4185,6 +4792,7 @@ def main() -> None:
     args = ap.parse_args()
     global TITLE
     TITLE = args.title
+    use_experiment(args.experiment)
     sys.stdout.reconfigure(encoding="utf-8")
     args.out.mkdir(parents=True, exist_ok=True)
     compare = None if args.smoke else args.compare  # smoke runs are 30 blocks long: nothing to compare with
@@ -4199,7 +4807,8 @@ def main() -> None:
         train = Data(gru_df)
         ctx = {"smoke": args.smoke, "gru_folder": summary["selected_folder"], "margins": summary["margins"],
                "stats": {"x_mean": train.x_mean, "x_std": train.x_std, "x_cols": train.x_cols},
-               "alarm": fit_alarm(alarm_df), "end_rule": args.end_rule}
+               "alarm": json.loads(args.alarm_file.read_text()) if args.alarm_file else fit_alarm(alarm_df),
+               "end_rule": args.end_rule, "experiment": args.experiment}
         (args.out / "alarm.json").write_text(json.dumps(ctx["alarm"], indent=2))
         print(f"GRU {summary['selected_folder']} (trained without schedules: {exclude or 'none'}), "
               f"end rule {args.end_rule}, alarm threshold {ctx['alarm']['threshold']:.3f}", flush=True)
@@ -4417,6 +5026,69 @@ PYCHECK
   xp5a_zip
 }
 
+# xp6: Krum only, backdoor (patch triggers) + targeted label flip, leak-free alarm-driven schedules.
+xp6_zip() {  # (re)write the final zip with everything produced so far
+  (cd "$WORK" && rm -f "$WORK/../xp6_all.zip" && zip -qr "$WORK/../xp6_all.zip" \
+     $(ls -d results/xp6 results/deploy_xp6 xp6_logs 2>/dev/null))
+  echo "== saved $(dirname "$WORK")/xp6_all.zip"
+}
+
+run_xp6_data() {
+  if [ "${XP6_SMOKE:-0}" = "1" ]; then SMOKE_DATA=(--seeds 40 --set n_blocks=30); else SMOKE_DATA=(); fi
+  echo "== xp6 step 1: data (400 seen + 60 twins + 40 held-out runs; Fashion-MNIST; Krum; alarm-driven schedules)"
+  "$PY" -u run_experiment.py xp6 --jobs "$JOBS" "${SMOKE_DATA[@]}" $EXTRA
+  mkdir -p results/xp6/runs_xp6
+  cp runs_xp6/all_blocks.csv results/xp6/runs_xp6/all_blocks.csv
+  (cd "$WORK" && rm -f "$WORK/../results_xp6_data.zip" && zip -qr "$WORK/../results_xp6_data.zip" runs_xp6)
+  echo "== saved $(dirname "$WORK")/results_xp6_data.zip"
+  xp6_zip
+}
+
+find_xp6_data() {
+  if [ -n "${XP6_DATA:-}" ]; then echo "$XP6_DATA"; return; fi
+  if [ -f "$WORK/results/xp6/runs_xp6/all_blocks.csv" ]; then echo "$WORK/results/xp6/runs_xp6/all_blocks.csv"; return; fi
+  local f
+  f=$(find /kaggle/input -path '*runs_xp6/all_blocks.csv' 2>/dev/null | head -1)
+  if [ -z "$f" ]; then
+    local z; z=$(find /kaggle/input \( -name 'results_xp6_data*.zip' -o -name 'xp6_all*.zip' \) 2>/dev/null | head -1)
+    if [ -n "$z" ]; then
+      unzip -qo "$z" '*runs_xp6/all_blocks.csv' -d "$WORK/xp6_unzipped" \
+        && f=$(find "$WORK/xp6_unzipped" -path '*runs_xp6/all_blocks.csv' | head -1)
+    fi
+  fi
+  echo "$f"
+}
+
+run_xp6_final() {
+  local data smoke="${XP6_SMOKE:-0}"
+  data=$(find_xp6_data)
+  if [ -z "$data" ] || [ ! -f "$data" ]; then
+    echo "xp6 data not found: run 'xp6_data' first, attach results_xp6_data.zip as a dataset, or set XP6_DATA=/path/all_blocks.csv"; exit 1
+  fi
+  mkdir -p results/xp6/runs_xp6 xp6_logs
+  [ "$data" -ef results/xp6/runs_xp6/all_blocks.csv ] || cp "$data" results/xp6/runs_xp6/all_blocks.csv
+  "$PY" - "$smoke" <<'PYCHECK'
+import sys
+import pandas as pd
+d = pd.read_csv("results/xp6/runs_xp6/all_blocks.csv", usecols=["run_id", "defense", "attack"])
+n, rows = d.run_id.nunique(), sorted(d.groupby("run_id").size().unique())
+print(f"xp6 data: {n} runs, rows per run {rows}, defenses {sorted(d.defense.unique())}, attacks {sorted(d.attack.unique())}")
+if sys.argv[1] != "1" and (n != 500 or rows != [251]):
+    raise SystemExit("unexpected xp6 data: expected 500 runs x 251 rows")
+PYCHECK
+  local ep=(); [ "$smoke" = "1" ] && ep=(--epochs 2)
+  echo "== xp6 step 2a: one GRU on all seen xp6 runs (3 candidates, selected on validation) + benefit / kill checks"
+  "$PY" -u gru_xp5.py --runs results/xp6/runs_xp6/all_blocks.csv --out results/xp6/gru "${ep[@]}" | tee xp6_logs/gru.txt
+  xp6_zip
+  local dsm=(); [ "$smoke" = "1" ] && dsm=(--smoke)
+  echo "== xp6 step 2b: deployment (10 environments incl. 2 held-out x 3 seeds x 8 policies; fixed xp5 alarm; end rule 'freeze')"
+  "$PY" -u deploy_xp5.py --experiment xp6 --jobs "$JOBS" --runs results/xp6/runs_xp6/all_blocks.csv \
+    --gru-summary results/xp6/gru/summary.json --out results/deploy_xp6 --alarm-file poison_testbed/alarm_xp5.json \
+    --end-rule freeze --title xp6 --policies clean_ref off on oracle threshold threshold_low gru gru_free \
+    "${dsm[@]}" | tee xp6_logs/deploy.txt
+  xp6_zip
+}
+
 # GRU candidates for xp3: name hidden lr weight_decay. xp1/xp2 settings (64, 2e-3, 0) overfit xp3 after 2 epochs.
 XP3_SWEEP=("a 64 5e-4 0" "b 32 5e-4 1e-3" "c 64 2e-4 1e-2" "d 128 5e-4 1e-2")
 
@@ -4481,6 +5153,9 @@ case "$STAGE" in
   xp5_data)       run_xp5_data ;;
   xp5_final)      run_xp5_final ;;
   xp5a)           run_xp5a ;;
+  xp6_data)       run_xp6_data ;;
+  xp6_final)      run_xp6_final ;;
+  xp6)            run_xp6_data; run_xp6_final ;;
   xp3_deploy)     run_xp3_deploy ;;
 esac
 echo "== done in $((SECONDS / 60)) min"

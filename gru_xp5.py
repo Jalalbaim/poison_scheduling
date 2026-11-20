@@ -65,7 +65,7 @@ def groups_of(df: pd.DataFrame) -> pd.Series:
     return df.run_id.map(g)
 
 
-SCHEDULE_FAMILIES = ("sticky", "react", "probehold", "probe", "on", "off")
+SCHEDULE_FAMILIES = ("sticky", "react", "probehold", "probe", "on", "off", "alarm")
 
 
 def schedule_family(run_id: pd.Series) -> pd.Series:
@@ -174,7 +174,7 @@ def fig_errors(table: pd.DataFrame, out: Path) -> None:
         if held:
             ax.axvspan(min(held) - 0.5, max(held) + 0.5, color=INK2, alpha=0.07, linewidth=0)
     axes[0].legend(fontsize=8)
-    fig.suptitle("xp5: one GRU for all configurations: error on seen test runs (by family) and on held-out "
+    fig.suptitle("One GRU for all configurations: error on seen test runs (by family) and on held-out "
                  "configurations (shaded)", fontsize=10, color=INK, x=0.01, ha="left")
     fig.tight_layout(rect=(0, 0, 1, 0.93))
     fig.savefig(out / "prediction_error.png", dpi=130)
