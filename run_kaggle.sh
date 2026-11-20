@@ -1568,7 +1568,8 @@ cat > poison_testbed/alarm_xp5.json <<'__KRUM_TESTBED_EOF__'
     ]
   },
   "threshold": 3.666642462644976
-}__KRUM_TESTBED_EOF__
+}
+__KRUM_TESTBED_EOF__
 cat > run_experiment.py <<'__KRUM_TESTBED_EOF__'
 """Data-poisoning testbed experiments.
 
