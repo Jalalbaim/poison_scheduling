@@ -9,3 +9,9 @@ data/
 .pytest_cache/
 results/
 draft.tex
+
+CPC_DP/reference/
+CPC_DP/notes/
+CPC_DP/README.md
+
+GRU_mnist/README.md
