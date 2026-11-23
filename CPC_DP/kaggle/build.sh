@@ -12,7 +12,7 @@ PAIRS=()
 for f in "$G"/poison_testbed/*.py; do PAIRS+=("$f:poison_testbed/$(basename "$f")"); done
 PAIRS+=("$G/poison_testbed/alarm_xp5.json:poison_testbed/alarm_xp5.json" "$G/run_experiment.py:run_experiment.py"
         "$G/tests/test_testbed.py:tests/test_testbed.py" "onset_twins.py:onset_twins.py"
-        "tests/test_onset_twins.py:tests/test_onset_twins.py")
+        "tests/test_onset_twins.py:tests/test_onset_twins.py" "xp7.py:xp7.py" "tests/test_xp7.py:tests/test_xp7.py")
 
 for p in "${PAIRS[@]}"; do if grep -q "$DELIM" "${p%%:*}"; then echo "delimiter found in ${p%%:*}" >&2; exit 1; fi; done
 {
