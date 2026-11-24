@@ -16,7 +16,6 @@ import torch
 from . import _GRU  # noqa: F401  (sys.path)
 from analyze import DEFENSES  # noqa: E402
 from gru_experiment import Data, x_columns  # noqa: E402
-from gru_xp5 import groups_of, seen_splits  # noqa: E402
 
 FORBIDDEN_PREFIXES = ("y_", "u_")  # outcomes and attack labels: never an input
 N_DEF = len(DEFENSES)
@@ -41,6 +40,7 @@ class Splits:
 
 def load_splits(csv: str) -> Splits:
     """xp6 splits as in gru_xp5 (seen runs split by seed; held-out groups never trained on)."""
+    from gru_xp5 import groups_of, seen_splits  # lazy: gru_xp5 pulls in most of GRU_mnist (not bundled on Kaggle)
     df = pd.read_csv(csv, dtype={"round_start": "Int64", "W": "Int64"}, low_memory=False)
     _, train, val, test = seen_splits(df, [])
     return Splits(train, val, test, df[groups_of(df) != "seen"])

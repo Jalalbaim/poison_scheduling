@@ -136,3 +136,61 @@ def delta_metrics(df: pd.DataFrame, by: list[str]) -> pd.DataFrame:
             "share_true_pos": pos.mean(),
         })
     return df.groupby(by).apply(one, include_groups=False).reset_index()
+
+
+# ----------------------------------------------------------------------------- whole-run Delta (xp7, agreed 2026-11-24)
+def score_twins_whole(pred, rd: RunData, manifest: pd.DataFrame, lam: float = 1.0) -> pd.DataFrame:
+    """Delta(H_t) = U(on over [t, t + k), off elsewhere) - U(off), U = mean over blocks t..T of
+    (y_clean - lam * y_atk): every block after the decision counts (the attack coming back after Krum goes off, the
+    clean-accuracy dip while Krum is on). Rows t+1 .. n-1 hold the outcomes after blocks t .. T.
+    manifest: one 'off' run per 'base' plus its 'on' plans (columns base, plan, t, k, run_id, ...)."""
+    pos = {r: i for i, r in enumerate(rd.run_ids)}
+    n = rd.n_rows
+    out = []
+    for base, g in manifest.groupby("base"):
+        i_off = pos[g[g.plan == "off"].run_id.iloc[0]]
+        Y_off = rd.Y[i_off].numpy()
+        for t, gt in g[g.plan == "on"].groupby("t"):
+            t = int(t)
+            plans = [torch.zeros(n)]
+            for r in gt.itertuples():
+                p = torch.zeros(n)
+                p[t + 1:t + 1 + int(r.k)] = 1
+                if not torch.equal(p, rd.W[pos[r.run_id]]):
+                    raise ValueError(f"plan of {r.run_id} does not match its logged W")
+                plans.append(p)
+            yhat = pred.plans(rd, i_off, t, torch.stack(plans)).numpy()  # (P, n-1-t, 2): rows t+1 .. n-1
+            u_hat = (yhat[..., 0] - lam * yhat[..., 1]).mean(1)
+            c_hat, a_hat = yhat[..., 0].mean(1), yhat[..., 1].mean(1)
+            for j, r in enumerate(gt.itertuples(), start=1):
+                Y_on = rd.Y[pos[r.run_id]].numpy()
+                seg_on, seg_off = Y_on[t + 1:], Y_off[t + 1:]
+                out.append({
+                    "model": pred.name, "base": base, "seed": r.seed, "split": r.split, "family": r.family,
+                    "persistent": r.persistent, "d": int(r.d), "k": int(r.k), "t": t,
+                    "true_delta": float((seg_on[:, 0] - lam * seg_on[:, 1]).mean() - (seg_off[:, 0] - lam * seg_off[:, 1]).mean()),
+                    "pred_delta": float(u_hat[j] - u_hat[0]),
+                    "true_clean": float(seg_on[:, 0].mean() - seg_off[:, 0].mean()), "pred_clean": float(c_hat[j] - c_hat[0]),
+                    "true_atk_benefit": float(seg_off[:, 1].mean() - seg_on[:, 1].mean()),
+                    "pred_atk_benefit": float(a_hat[0] - a_hat[j]),
+                })
+    return pd.DataFrame(out)
+
+
+def best_margin(val: pd.DataFrame) -> float:
+    """Margin m maximising the decision value on validation twins: defend iff pred_delta > m."""
+    cands = np.unique(np.concatenate([[0.0], val.pred_delta.to_numpy()]))
+    vals = [(val.true_delta * (val.pred_delta > m)).mean() for m in cands]
+    return float(cands[int(np.argmax(vals))] - 1e-9)
+
+
+def decision_table(test: pd.DataFrame, margin: float) -> dict:
+    """Mean true Delta obtained on test twins (0 = never defend). oracle = defend exactly when Delta > 0."""
+    t, p = test.true_delta.to_numpy(), test.pred_delta.to_numpy()
+    model = float((t * (p > margin)).mean())
+    oracle = float(np.clip(t, 0, None).mean())
+    return {"margin": margin, "value_model": model, "value_always": float(t.mean()), "value_oracle": oracle,
+            "share_of_oracle": model / oracle if oracle > 0 else np.nan, "defend_rate": float((p > margin).mean()),
+            "corr": float(np.corrcoef(p, t)[0, 1]) if p.std() > 0 else np.nan,
+            "auc": float(roc_auc_score(t > 0, p)) if 0 < (t > 0).mean() < 1 else np.nan,
+            "rmse": float(np.sqrt(np.mean((p - t) ** 2))), "pred_mean": float(p.mean()), "true_mean": float(t.mean())}

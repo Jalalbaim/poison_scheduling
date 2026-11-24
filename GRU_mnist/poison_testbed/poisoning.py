@@ -103,6 +103,9 @@ def make_attack(name: str, *, sign_flip_scale: float = 1.0, alie_z: float | str 
         "flip_win": AttackSpec("flip_win", "data", corrupt=targeted_flip, window=window, outcome="flip"),
         "alie_win": AttackSpec("alie_win", "gradient", attack_cls=ALIEAttack, attack_kwargs={"z": alie_z},
                                window=window, outcome="none"),
+        # xp7: windowed sign flip (no targeted harm: its harm is in y_clean_acc, like alie_win)
+        "sign_flip_win": AttackSpec("sign_flip_win", "gradient", attack_cls=SignFlipAttack,
+                                    attack_kwargs={"scale": sign_flip_scale}, window=window, outcome="none"),
         "sign_flip": AttackSpec("sign_flip", "gradient", attack_cls=SignFlipAttack,
                                 attack_kwargs={"scale": sign_flip_scale}),
     }

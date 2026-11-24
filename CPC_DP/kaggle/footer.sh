@@ -25,11 +25,21 @@ run_xp7() {  # $1 = a | b | twins
   echo "== saved $(dirname "$WORK")/$name.zip"
 }
 
+run_xp7_deploy() {
+  local args=() out=results/deploy_xp7 name=xp7_deploy
+  if [ "${CPC_SMOKE:-0}" = "1" ]; then args=(--smoke); out=results/deploy_xp7/smoke; name=xp7_deploy_smoke; fi
+  echo "== xp7 deployment: gru / CPC A2 trained on gamma 0 and on the hard alarm, as Krum controllers"
+  "$PY" -u deploy_xp7.py --jobs "$JOBS" --models gru_g0=g0/gru cpc_g0=g0/A2 gru_hard=hard/gru cpc_hard=hard/A2     "${args[@]}"
+  (cd "$WORK" && rm -f "$WORK/../$name.zip" && zip -qr "$WORK/../$name.zip" results/deploy_xp7)
+  echo "== saved $(dirname "$WORK")/$name.zip"
+}
+
 SECONDS=0
 case "$STAGE" in
   xp6_eval) run_xp6_eval ;;
   xp7_a) run_xp7 a ;;
   xp7_b) run_xp7 b ;;
   xp7_twins) run_xp7 twins ;;
+  xp7_deploy) run_xp7_deploy ;;
 esac
 echo "== done in $((SECONDS / 60)) min"

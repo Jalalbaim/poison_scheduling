@@ -9,6 +9,8 @@
 #     !bash run_kaggle_cpc.sh xp7_b      # xp7 main runs, gamma 8 and hard alarm: 400 runs -> xp7_b.zip (~4 h)
 #     !bash run_kaggle_cpc.sh xp7_twins  # xp7 onset twins, val + test setups: 264 runs -> xp7_twins.zip (~3 h)
 #   The three xp7 stages are independent: run them in parallel sessions or one after another.
+#     !bash run_kaggle_cpc.sh xp7_deploy # deployment of 4 trained models (embedded) as Krum controllers:
+#                                        #   9 environments x 3 seeds x 9 policies, 225 runs -> xp7_deploy.zip (~2.5-3 h)
 #
 # Same WORK and venv as GRU_mnist's run_kaggle.sh: both scripts can run in one notebook (e.g. xp6 then xp6_eval
 # in two sessions, or this one alone). Never feed xp6_eval runs to training or model selection: they are placed
@@ -25,7 +27,7 @@
 set -euo pipefail
 
 STAGE="${1:-xp6_eval}"
-case "$STAGE" in xp6_eval|xp7_a|xp7_b|xp7_twins) ;; *) echo "usage: $0 [xp6_eval|xp7_a|xp7_b|xp7_twins]"; exit 2;; esac
+case "$STAGE" in xp6_eval|xp7_a|xp7_b|xp7_twins|xp7_deploy) ;; *) echo "usage: $0 [xp6_eval|xp7_a|xp7_b|xp7_twins|xp7_deploy]"; exit 2;; esac
 if [ -d /kaggle/working ]; then DEFAULT_WORK=/kaggle/working/testbed; else DEFAULT_WORK="$PWD/testbed"; fi
 WORK="${WORK:-$DEFAULT_WORK}"
 JOBS="${JOBS:-$(nproc)}"
@@ -60,4 +62,4 @@ PYCHECK
 # 2. Source (embedded): GRU_mnist testbed + CPC_DP scripts, flat in $WORK.
 # ---------------------------------------------------------------------------
 echo "== writing source"
-mkdir -p poison_testbed tests
+mkdir -p poison_testbed tests cpc

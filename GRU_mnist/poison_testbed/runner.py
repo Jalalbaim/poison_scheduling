@@ -10,6 +10,7 @@ from dataclasses import asdict, dataclass, field, replace
 from pathlib import Path
 from typing import Any, Callable
 
+import numpy as np
 import pandas as pd
 import torch
 
@@ -91,6 +92,10 @@ class RunConfig:
     trigger: str = "corner"
     flip_source: int = 1
     extended_log: bool = False
+    # xp7: non-iid workers. None = every worker samples the full training set (iid, xp1-xp6). A float = Dirichlet
+    # concentration: each class's training images are split across the n workers with shares ~ Dir(alpha), fixed
+    # per seed (smaller alpha = more skewed workers; Krum then discards honest but unusual gradients).
+    noniid_alpha: float | None = None
     device: str = field(default_factory=lambda: "cuda" if torch.cuda.is_available() else "cpu")
 
     @property
@@ -113,7 +118,8 @@ class RunConfig:
 
 
 LATER_FIELDS = {"burst": None, "always_measure_backdoor": False, "signals": "v1", "dataset": "mnist",
-                "trigger": "corner", "flip_source": 1, "extended_log": False}
+                "trigger": "corner", "flip_source": 1, "extended_log": False,
+                "noniid_alpha": None}
 
 
 def is_legacy_data(cfg: "RunConfig") -> bool:
@@ -209,6 +215,39 @@ def make_schedule(cfg: RunConfig) -> list[int]:
     raise ValueError(f"Unknown schedule {cfg.schedule!r}")
 
 
+def worker_datasets(train: torch.utils.data.TensorDataset, cfg: RunConfig) -> list:
+    """One training set per worker: the full set for every worker (iid), or a Dirichlet split by class (xp7)."""
+    if cfg.noniid_alpha is None:
+        return [train] * cfg.n
+    x, y = train.tensors
+    gen = torch.Generator().manual_seed(cfg.seed + NONIID_STREAM)
+    conc = torch.full((cfg.n,), float(cfg.noniid_alpha))
+    parts: list[list[torch.Tensor]] = [[] for _ in range(cfg.n)]
+    for c in range(int(y.max()) + 1):
+        idx = (y == c).nonzero().flatten()
+        idx = idx[torch.randperm(len(idx), generator=gen)]
+        share = _dirichlet(conc, gen)
+        cuts = (share.cumsum(0) * len(idx)).round().long().tolist()
+        for w, (a, b) in enumerate(zip([0] + cuts[:-1], cuts)):
+            parts[w].append(idx[a:b])
+    out = []
+    for w in range(cfg.n):
+        idx = torch.cat(parts[w])
+        if len(idx) < cfg.batch_size:
+            raise ValueError(f"worker {w} has {len(idx)} images (< batch {cfg.batch_size}); raise noniid_alpha")
+        out.append(torch.utils.data.TensorDataset(x[idx], y[idx]))
+    return out
+
+
+def _dirichlet(conc: torch.Tensor, gen: torch.Generator) -> torch.Tensor:
+    """Dirichlet draw from a seeded generator (torch.distributions has no generator argument)."""
+    rng = np.random.default_rng(int(torch.randint(0, 2**31 - 1, (1,), generator=gen)))
+    return torch.from_numpy(rng.dirichlet(conc.numpy())).float()
+
+
+NONIID_STREAM = 50_000
+
+
 def defense_kwargs(cfg: RunConfig) -> dict[str, Any]:
     return {"C": cfg.C, "sigma": cfg.sigma} if cfg.defense == "ClipNoise" else {}
 
@@ -232,7 +271,7 @@ def build(cfg: RunConfig) -> PoisoningSimulation:
         C_ref=cfg.C,
         signals_v2=cfg.signals == "v2",
         model_cls=Krum2017MLPMnist,
-        train_datasets=[data.train] * cfg.n,
+        train_datasets=worker_datasets(data.train, cfg),
         test_set=torch.utils.data.TensorDataset(*data.test),
         n=cfg.n,
         f=cfg.f,
@@ -283,7 +322,7 @@ def simulate(cfg: RunConfig, policy: Policy | None = None) -> pd.DataFrame:
     observable part of rows -1..b-1 only (see ``observable``). ``extra`` is logged on block b's row.
     """
     if policy is None and is_alarm_schedule(cfg.schedule):  # xp6: W decided online from the observable alarm
-        policy = alarm_policy(cfg.schedule)
+        policy = alarm_policy(cfg.schedule, cfg.sched_seed)
     sim = build(cfg)
     base = {"run_id": cfg.run_id, "seed": cfg.seed, "schedule_seed": cfg.sched_seed, "defense": cfg.defense,
             "attack": cfg.attack, "poison_frac": cfg.poison_frac, "n": cfg.n, "f": cfg.f}
