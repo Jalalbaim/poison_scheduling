@@ -1,6 +1,6 @@
 """Score the xp7 models on the onset twins with the whole-run Delta (cpc/evaluate.score_twins_whole).
 
-    ../.venv/Scripts/python score_xp7.py                 # -> results/xp7_scores/{twins.csv, summary.csv, by_family.csv}
+    ../.venv/Scripts/python xp7/score_xp7.py                 # -> results/xp7/scores/{twins.csv, summary.csv, by_family.csv}
 
 Margins (defend iff predicted Delta > margin) are chosen on the VALIDATION twins; every reported number is on the
 TEST twins. A model trained at level L is scored on the same twins as every other model (twins are open loop,
@@ -8,6 +8,7 @@ independent of the policy level).
 """
 
 import argparse
+import sys
 import json
 from pathlib import Path
 
@@ -15,14 +16,16 @@ import pandas as pd
 import torch
 
 HERE = Path(__file__).resolve().parent
+ROOT = HERE.parent if HERE.name in ("xp6", "xp7") else HERE  # local: CPC_DP/xp7/; Kaggle: files flat in $WORK
+sys.path.insert(0, str(ROOT))
 from cpc import xp7data as X  # noqa: E402
 from cpc.data import RunData  # noqa: E402
 from cpc.evaluate import CPCPredictor, GRUPredictor, best_margin, decision_table, score_twins_whole  # noqa: E402
 from cpc.train import load  # noqa: E402
 from gru_experiment import OutcomeGRU  # noqa: E402
 
-MODELS = HERE / "results/xp7_models"
-OUT = HERE / "results/xp7_scores"
+MODELS = ROOT / "results/xp7/models"
+OUT = ROOT / "results/xp7/scores"
 
 
 def predictor(folder: Path, tr: RunData, device: str):

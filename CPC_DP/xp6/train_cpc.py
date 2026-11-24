@@ -1,7 +1,7 @@
 """Train one Causal CPC on xp6 (seen runs; splits of the xp6 OutcomeGRU) and report its factual error.
 
-    ../.venv/Scripts/python train_cpc.py --preset A2 --hidden 64 --out results/cpc/A2_h64
-    ../.venv/Scripts/python train_cpc.py --preset A0 --smoke            # a few epochs: pipeline check
+    ../.venv/Scripts/python xp6/train_cpc.py --preset A2 --hidden 64 --out results/xp6/models/A2_h64
+    ../.venv/Scripts/python xp6/train_cpc.py --preset A0 --smoke            # a few epochs: pipeline check
 
 Presets (cpc/train.py PRESETS): A0 no pretraining (the OutcomeGRU recipe in the CPC architecture), A1 + CPC
 pretraining, A2 + InfoMax, A3 + CLUB balancing, A4 + decoder feedback. --feedback / --no-feedback override.
@@ -9,6 +9,7 @@ Model selection (between hidden sizes / presets) is on the validation factual MS
 """
 
 import argparse
+import sys
 import json
 from dataclasses import asdict, replace
 from pathlib import Path
@@ -17,7 +18,9 @@ import pandas as pd
 import torch
 
 HERE = Path(__file__).resolve().parent
-DEFAULT_RUNS = HERE.parent / "GRU_mnist/results/xp6_all/results/xp6/runs_xp6/all_blocks.csv"
+ROOT = HERE.parent if HERE.name in ("xp6", "xp7") else HERE  # local: CPC_DP/xp7/; Kaggle: files flat in $WORK
+sys.path.insert(0, str(ROOT))
+DEFAULT_RUNS = ROOT.parent / "GRU_mnist/results/xp6_all/results/xp6/runs_xp6/all_blocks.csv"
 
 from cpc.data import RunData, load_splits  # noqa: E402
 from cpc.evaluate import CPCPredictor, factual_table  # noqa: E402
@@ -41,7 +44,7 @@ def main() -> None:
         cfg = replace(cfg, feedback=args.feedback)
     if args.smoke:
         cfg = replace(cfg, pre_epochs=3, epochs=3)
-    out = args.out or HERE / "results" / "cpc" / f"{args.preset}_h{args.hidden}{'_fb' if cfg.feedback else ''}{'_smoke' if args.smoke else ''}"
+    out = args.out or ROOT / "results/xp6/models" / f"{args.preset}_h{args.hidden}{'_fb' if cfg.feedback else ''}{'_smoke' if args.smoke else ''}"
 
     sp = load_splits(str(args.runs))
     tr = RunData(sp.train)

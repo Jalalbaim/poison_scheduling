@@ -1,7 +1,7 @@
 """Train the ablation ladder on xp6, locally: A0-A3 at hidden 32 / 64 / 128, then A4 (feedback) at the hidden size
 with the lowest A3 validation MSE. One training at a time (two ran out of RAM locally). Finished models are skipped on a rerun.
 
-    ../.venv/Scripts/python run_ladder.py            # -> results/cpc/<preset>_h<hidden>[_fb]/, logs in results/cpc/logs/
+    ../.venv/Scripts/python xp6/run_ladder.py            # -> results/xp6/models/<preset>_h<hidden>[_fb]/, logs in results/xp6/models/logs/
 """
 
 import json
@@ -11,7 +11,9 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
-OUT = HERE / "results" / "cpc"
+ROOT = HERE.parent if HERE.name in ("xp6", "xp7") else HERE  # local: CPC_DP/xp7/; Kaggle: files flat in $WORK
+sys.path.insert(0, str(ROOT))
+OUT = ROOT / "results/xp6/models"
 LOGS = OUT / "logs"
 SIZES = [32, 64, 128]
 JOBS = 1  # 2 ran out of RAM on the laptop

@@ -1,8 +1,8 @@
 """xp6 onset twins: EVALUATION-ONLY counterfactual ground truth for Delta_k(H_t) (assessment §3, §6 step 1).
 
-    ../.venv/Scripts/python onset_twins.py --jobs 4                       # 555 runs -> results/xp6_eval/
-    ../.venv/Scripts/python onset_twins.py --list                         # print the plan table, run nothing
-    ../.venv/Scripts/python onset_twins.py --smoke                        # 5 runs of 30 blocks (pipeline check)
+    ../.venv/Scripts/python xp6/onset_twins.py --jobs 4                       # 555 runs -> results/xp6/eval/
+    ../.venv/Scripts/python xp6/onset_twins.py --list                         # print the plan table, run nothing
+    ../.venv/Scripts/python xp6/onset_twins.py --smoke                        # 5 runs of 30 blocks (pipeline check)
 
 Estimand (agreed 2026-11-21): Delta_k(H_t) = E[U(on for k blocks from t, then off) - U(off) | H_t],
 U = y_clean(T) - lambda * y_atk(t + tau). Each selected xp6 seed is rerun under open-loop plans that share the
@@ -15,7 +15,7 @@ Same seed and config as the xp6 run, so the pair (plan, off) is identical before
 outcomes is the true Delta_k of that run at history H_t (the off run's own rows up to t).
 
 These runs are placed RELATIVE TO THE TRUE ATTACK WINDOW. That is fine for evaluation and would be a leak in
-training (the xp5 lesson): they live in their own folder (results/xp6_eval) and must never be read by a training
+training (the xp5 lesson): they live in their own folder (results/xp6/eval) and must never be read by a training
 or model-selection script. Seeds: the xp6 TEST split (same rule as gru_experiment.assign_splits) and the held-out
 groups. Nothing here changes the xp6 data, which is collected unchanged by GRU_mnist (run_kaggle.sh xp6).
 """
@@ -26,8 +26,10 @@ from dataclasses import replace
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
-if (HERE.parent / "GRU_mnist" / "run_experiment.py").exists():  # local layout; on Kaggle the files sit side by side
-    sys.path.insert(0, str(HERE.parent / "GRU_mnist"))
+ROOT = HERE.parent if HERE.name in ("xp6", "xp7") else HERE  # local: CPC_DP/xp7/; Kaggle: files flat in $WORK
+sys.path.insert(0, str(ROOT))
+if (ROOT.parent / "GRU_mnist" / "run_experiment.py").exists():  # local layout; on Kaggle the files sit side by side
+    sys.path.insert(0, str(ROOT.parent / "GRU_mnist"))
 
 import pandas as pd  # noqa: E402
 
@@ -79,7 +81,7 @@ def onset_configs(overrides: dict | None = None) -> tuple[list[RunConfig], pd.Da
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--jobs", type=int, default=1)
-    ap.add_argument("--out", type=Path, default=HERE / "results" / "xp6_eval")
+    ap.add_argument("--out", type=Path, default=ROOT / "results/xp6/eval")
     ap.add_argument("--set", action="append", default=[], metavar="KEY=VALUE", help="config override (as run_experiment)")
     ap.add_argument("--list", action="store_true", help="print the plan table and exit")
     ap.add_argument("--smoke", action="store_true", help="2 seeds x 3 plans, 30-block runs")

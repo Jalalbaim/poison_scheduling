@@ -1,8 +1,8 @@
 """xp7 deployment: the trained models as Krum controllers on new seeds (layout of GRU_mnist/deploy_xp5.py).
 
-    ../.venv/Scripts/python deploy_xp7.py --models gru_g0=g0/gru cpc_g0=g0/A0 ...   # -> results/deploy_xp7/
-    ../.venv/Scripts/python deploy_xp7.py --report-only
-    ../.venv/Scripts/python deploy_xp7.py --smoke --models ...                       # 30 blocks, 2 environments
+    ../.venv/Scripts/python xp7/deploy_xp7.py --models gru_g0=g0/gru cpc_g0=g0/A0 ...   # -> results/xp7/deploy/
+    ../.venv/Scripts/python xp7/deploy_xp7.py --report-only
+    ../.venv/Scripts/python xp7/deploy_xp7.py --smoke --models ...                       # 30 blocks, 2 environments
 
 Environments (Fashion-MNIST, Krum, 250 blocks of 2 rounds; 3 new seeds each: k = 0 early window, k = 1, 2 later;
 persistent: from block 1-10 to the end): the xp7 families (corner 2/8, patch 8/8, flip 8/8, ALIE, SignFlip 4.6,
@@ -36,6 +36,8 @@ from matplotlib.lines import Line2D  # noqa: E402
 from matplotlib.patches import Patch  # noqa: E402
 
 HERE = Path(__file__).resolve().parent
+ROOT = HERE.parent if HERE.name in ("xp6", "xp7") else HERE  # local: CPC_DP/xp7/; Kaggle: files flat in $WORK
+sys.path.insert(0, str(ROOT))
 from cpc import _GRU  # noqa: E402,F401
 from cpc.data import RunData  # noqa: E402
 from cpc.evaluate import CPCPredictor, GRUPredictor  # noqa: E402
@@ -48,9 +50,9 @@ from poison_testbed.runner import RunConfig, simulate  # noqa: E402
 from run_experiment import xp5_params  # noqa: E402
 from xp7 import SIGNFLIP_SCALE  # noqa: E402
 
-MODELS = HERE / "results/xp7_models"
-SCORES = HERE / "results/xp7_scores/summary.csv"
-OUT = HERE / "results/deploy_xp7"
+MODELS = ROOT / "results/xp7/models"
+SCORES = ROOT / "results/xp7/scores/summary.csv"
+OUT = ROOT / "results/xp7/deploy"
 N_BLOCKS, HORIZON, LAMBDA, SEED0 = 250, 20, 1.0, 60_000
 ALARM = "alarm_t3.67_d0_h20"
 ENVIRONMENTS = {  # name -> (RunConfig fields, persistent)

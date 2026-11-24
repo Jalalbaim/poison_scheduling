@@ -2,7 +2,7 @@
 # 3. Tests (testbed reproducibility + onset-twin plans). Stops here on failure.
 # ---------------------------------------------------------------------------
 echo "== tests"
-"$PY" -m pytest tests/test_testbed.py tests/test_onset_twins.py tests/test_xp7.py -q
+"$PY" -m pytest tests/test_testbed.py tests/test_onset_twins.py tests/test_xp7.py tests/test_xp8.py -q
 
 # ---------------------------------------------------------------------------
 # 4. Stages.
@@ -26,11 +26,20 @@ run_xp7() {  # $1 = a | b | twins
 }
 
 run_xp7_deploy() {
-  local args=() out=results/deploy_xp7 name=xp7_deploy
-  if [ "${CPC_SMOKE:-0}" = "1" ]; then args=(--smoke); out=results/deploy_xp7/smoke; name=xp7_deploy_smoke; fi
+  local args=() out=results/xp7/deploy name=xp7_deploy
+  if [ "${CPC_SMOKE:-0}" = "1" ]; then args=(--smoke); out=results/xp7/deploy/smoke; name=xp7_deploy_smoke; fi
   echo "== xp7 deployment: gru / CPC A2 trained on gamma 0 and on the hard alarm, as Krum controllers"
   "$PY" -u deploy_xp7.py --jobs "$JOBS" --models gru_g0=g0/gru cpc_g0=g0/A2 gru_hard=hard/gru cpc_hard=hard/A2     "${args[@]}"
-  (cd "$WORK" && rm -f "$WORK/../$name.zip" && zip -qr "$WORK/../$name.zip" results/deploy_xp7)
+  (cd "$WORK" && rm -f "$WORK/../$name.zip" && zip -qr "$WORK/../$name.zip" results/xp7/deploy)
+  echo "== saved $(dirname "$WORK")/$name.zip"
+}
+
+run_xp8() {  # $1 = 1 | 2
+  local args=() out=results/xp8/part$1 name=xp8_part$1
+  if [ "${CPC_SMOKE:-0}" = "1" ]; then args=(--smoke); out=results/xp8/part$1_smoke; name=xp8_part$1_smoke; fi
+  echo "== xp8 part $1: trunks (Krum always off / always on) + paired branches, decision at step t uses step t"
+  "$PY" -u xp8.py --part "$1" --jobs "$JOBS" --budget-hours "${XP8_BUDGET_H:-11}" "${args[@]}"
+  (cd "$WORK" && rm -f "$WORK/../$name.zip" && zip -qr "$WORK/../$name.zip" "$out/all_blocks.parquet" "$out/manifest.csv" "$out/jobs.csv" "$out/summary.json")
   echo "== saved $(dirname "$WORK")/$name.zip"
 }
 
@@ -41,5 +50,7 @@ case "$STAGE" in
   xp7_b) run_xp7 b ;;
   xp7_twins) run_xp7 twins ;;
   xp7_deploy) run_xp7_deploy ;;
+  xp8_1) run_xp8 1 ;;
+  xp8_2) run_xp8 2 ;;
 esac
 echo "== done in $((SECONDS / 60)) min"

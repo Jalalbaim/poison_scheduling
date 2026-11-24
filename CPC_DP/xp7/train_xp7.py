@@ -1,7 +1,7 @@
 """Train the GRU and Causal CPC models on xp7, one set per policy level (g0, g2, g8, hard), locally, one at a time.
 
-    ../.venv/Scripts/python train_xp7.py                     # -> results/xp7_models/<level>/<model>/
-    ../.venv/Scripts/python train_xp7.py --levels g0 --models gru A0 --smoke
+    ../.venv/Scripts/python xp7/train_xp7.py                     # -> results/xp7/models/<level>/<model>/
+    ../.venv/Scripts/python xp7/train_xp7.py --levels g0 --models gru A0 --smoke
 
 Models: gru = the xp6 OutcomeGRU baseline (model d: hidden 128, lr 5e-4, wd 1e-2, patience 40);
 A0 / A2 / A3 = Causal CPC presets (cpc/train.py) at hidden 64: no pretraining / CPC + InfoMax / + CLUB.
@@ -10,6 +10,7 @@ Finished models (report.json present) are skipped.
 """
 
 import argparse
+import sys
 import json
 import time
 from dataclasses import asdict, replace
@@ -19,11 +20,13 @@ import numpy as np
 import torch
 
 HERE = Path(__file__).resolve().parent
+ROOT = HERE.parent if HERE.name in ("xp6", "xp7") else HERE  # local: CPC_DP/xp7/; Kaggle: files flat in $WORK
+sys.path.insert(0, str(ROOT))
 from cpc import xp7data as X  # noqa: E402
 from cpc.train import PRESETS, Config, save, train_model  # noqa: E402
 from gru_experiment import fit_gru  # noqa: E402
 
-OUT = HERE / "results/xp7_models"
+OUT = ROOT / "results/xp7/models"
 MODELS = ["gru", "A0", "A2", "A3"]
 GRU_HP = dict(hidden=128, lr=5e-4, wd=1e-2)
 

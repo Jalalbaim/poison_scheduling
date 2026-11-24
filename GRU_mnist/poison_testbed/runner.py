@@ -96,6 +96,8 @@ class RunConfig:
     # concentration: each class's training images are split across the n workers with shares ~ Dir(alpha), fixed
     # per seed (smaller alpha = more skewed workers; Krum then discards honest but unusual gradients).
     noniid_alpha: float | None = None
+    # xp8: number of Byzantine workers when it differs from f (Krum and the signals always assume f).
+    n_attackers: int | None = None
     device: str = field(default_factory=lambda: "cuda" if torch.cuda.is_available() else "cpu")
 
     @property
@@ -119,7 +121,7 @@ class RunConfig:
 
 LATER_FIELDS = {"burst": None, "always_measure_backdoor": False, "signals": "v1", "dataset": "mnist",
                 "trigger": "corner", "flip_source": 1, "extended_log": False,
-                "noniid_alpha": None}
+                "noniid_alpha": None, "n_attackers": None}
 
 
 def is_legacy_data(cfg: "RunConfig") -> bool:
@@ -270,6 +272,7 @@ def build(cfg: RunConfig) -> PoisoningSimulation:
         block_len=cfg.block_len,
         C_ref=cfg.C,
         signals_v2=cfg.signals == "v2",
+        n_byz=cfg.n_attackers,
         model_cls=Krum2017MLPMnist,
         train_datasets=worker_datasets(data.train, cfg),
         test_set=torch.utils.data.TensorDataset(*data.test),

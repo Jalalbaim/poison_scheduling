@@ -1,10 +1,10 @@
 """xp7: when to switch Krum on, under 4 levels of confounding (notes/03_xp7_design.md).
 
-    ../.venv/Scripts/python xp7.py --list                   # plan table, run nothing
-    ../.venv/Scripts/python xp7.py --part a --jobs 4        # main runs, gamma 0 and 2     (400 runs)
-    ../.venv/Scripts/python xp7.py --part b --jobs 4        # main runs, gamma 8 and hard  (400 runs)
-    ../.venv/Scripts/python xp7.py --part twins --jobs 4    # onset twins, val + test seeds (EVALUATION/SELECTION ONLY)
-    ../.venv/Scripts/python xp7.py --part a --smoke         # 6 runs of 30 blocks (pipeline check)
+    ../.venv/Scripts/python xp7/xp7.py --list                   # plan table, run nothing
+    ../.venv/Scripts/python xp7/xp7.py --part a --jobs 4        # main runs, gamma 0 and 2     (400 runs)
+    ../.venv/Scripts/python xp7/xp7.py --part b --jobs 4        # main runs, gamma 8 and hard  (400 runs)
+    ../.venv/Scripts/python xp7/xp7.py --part twins --jobs 4    # onset twins, val + test seeds (EVALUATION/SELECTION ONLY)
+    ../.venv/Scripts/python xp7/xp7.py --part a --smoke         # 6 runs of 30 blocks (pipeline check)
 
 Design
 - 200 base setups (seed, attack, window, target), each run under the 4 policies below: the gamma levels differ
@@ -25,8 +25,10 @@ from dataclasses import replace
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
-if (HERE.parent / "GRU_mnist" / "run_experiment.py").exists():  # local layout; on Kaggle the files sit side by side
-    sys.path.insert(0, str(HERE.parent / "GRU_mnist"))
+ROOT = HERE.parent if HERE.name in ("xp6", "xp7") else HERE  # local: CPC_DP/xp7/; Kaggle: files flat in $WORK
+sys.path.insert(0, str(ROOT))
+if (ROOT.parent / "GRU_mnist" / "run_experiment.py").exists():  # local layout; on Kaggle the files sit side by side
+    sys.path.insert(0, str(ROOT.parent / "GRU_mnist"))
 
 import numpy as np  # noqa: E402
 import pandas as pd  # noqa: E402
@@ -146,7 +148,7 @@ def main() -> None:
     print(f"total runs: {len(configs)}", flush=True)
     if args.list:
         return
-    out = args.out or HERE / "results" / f"xp7_{args.part}{'_smoke' if args.smoke else ''}"
+    out = args.out or ROOT / "results/xp7" / f"{args.part}{'_smoke' if args.smoke else ''}"
     out.mkdir(parents=True, exist_ok=True)
     manifest.to_csv(out / "manifest.csv", index=False)
     R.execute(configs, out, args.jobs)

@@ -14,7 +14,11 @@ Differences from ``CentralisedSimulation.step`` (library code is not modified):
   position cannot reveal who is Byzantine;
 * ClipNoise noise is drawn every round from a dedicated stream, whether or not the
   defense is on (common random numbers across schedules);
-* ``step`` returns the per-round signals X, computed before aggregation.
+* ``step`` returns the per-round signals X, computed before aggregation. It is ``gather`` (gradients and
+  signals) then ``apply`` (aggregate and update): a caller can decide the aggregator of a round from that
+  round's own signals by setting ``schedule`` between the two (xp8);
+* ``n_byz`` (xp8): number of Byzantine workers, which may differ from ``f``, the number Krum and the
+  signals assume (default: equal).
 """
 
 from typing import Any
@@ -46,6 +50,7 @@ class PoisoningSimulation(KrumSimulation):
         block_len: int,
         C_ref: float,
         signals_v2: bool = False,
+        n_byz: int | None = None,
         **kwargs: Any,
     ) -> None:
         # The library's own aggregator/attack slots are left empty: this subclass's step() handles both.
@@ -59,6 +64,10 @@ class PoisoningSimulation(KrumSimulation):
         self.block_len = block_len
         self.C_ref = C_ref
         self.tracker = SignalTrackerV2(self.n, self.f) if signals_v2 else None
+        self.n_byz = self.f if n_byz is None else n_byz
+        if not 0 <= self.n_byz < self.n:
+            raise ValueError(f"n_byz must be in [0, n), got {self.n_byz}")
+        self._pending: tuple[int, torch.Tensor] | None = None
         if len(schedule) * block_len != self.rounds:
             raise ValueError(f"schedule covers {len(schedule) * block_len} rounds, expected {self.rounds}")
 
@@ -92,12 +101,20 @@ class PoisoningSimulation(KrumSimulation):
         return self._model.relink_gradients().clone(), loss.detach(), per_sample, y
 
     def step(self) -> dict[str, float]:
+        x_round = self.gather()
+        self.apply()
+        return x_round
+
+    def gather(self) -> dict[str, float]:
+        """First half of a round: every worker's gradient and the round's signals (nothing is aggregated)."""
+        if self._pending is not None:
+            raise RuntimeError("gather() called twice without apply()")
         if self._model is None:
             raise RuntimeError("Simulation not set up. Call setup() first.")
         t = self._current_round
         block = t // self.block_len
         attacking = self.attack_spec.active(block)
-        n_honest = self.n - self.f
+        n_honest = self.n - self.n_byz
         spec = self.attack_spec
 
         grads: list[torch.Tensor] = []
@@ -121,7 +138,7 @@ class PoisoningSimulation(KrumSimulation):
 
         if attacking and spec.kind == "gradient":
             assert spec.attack_cls is not None
-            byz = spec.attack_cls.generate(torch.stack(grads[:n_honest]), f=self.f, **spec.attack_kwargs)
+            byz = spec.attack_cls.generate(torch.stack(grads[:n_honest]), f=self.n_byz, **spec.attack_kwargs)
             grads.extend(byz)
 
         perm = torch.randperm(self.n, generator=self._perm_gen, device=self.device)
@@ -133,6 +150,15 @@ class PoisoningSimulation(KrumSimulation):
                 mb_losses = mb_losses[perm]  # same order as the gradients
             x_round.update(self.tracker(stacked, mb_losses, torch.cat(sample_losses), torch.cat(sample_labels)))
 
+        self._pending = (t, stacked)
+        return x_round
+
+    def apply(self) -> None:
+        """Second half of a round: aggregate with schedule[round // block_len] and update the model."""
+        if self._pending is None:
+            raise RuntimeError("apply() called before gather()")
+        t, stacked = self._pending
+        self._pending = None
         noise = torch.randn(stacked.shape[1], generator=self._noise_gen, device=self.device, dtype=stacked.dtype)
         defense_kwargs = dict(self.defense_kwargs)
         if issubclass(self.defense, ClipNoise):
@@ -147,7 +173,6 @@ class PoisoningSimulation(KrumSimulation):
         with torch.no_grad():
             self._model.parameters.add_(self._model.gradients, alpha=-self._current_lr)
         self._current_round += 1
-        return x_round
 
     @torch.no_grad()
     def accuracy_loss(self, x: torch.Tensor, y: torch.Tensor) -> tuple[float, float]:

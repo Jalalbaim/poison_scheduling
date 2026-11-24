@@ -22,9 +22,9 @@ import pandas as pd
 from .data import RunData, input_columns
 
 HERE = Path(__file__).resolve().parent.parent
-RES = HERE / "results"
-SRC = {"a": RES / "xp7_a/results/xp7_a", "b": RES / "xp7_b/results/xp7_b", "twins": RES / "xp7_twins/results/xp7_twins"}
-CACHE = RES / "xp7_cache"
+RES = HERE / "results/xp7"
+SRC = {p: RES / p for p in ("a", "b", "twins")}
+CACHE = RES / "cache"
 LEVELS = ["g0", "g2", "g8", "hard"]
 PART_OF = {"g0": "a", "g2": "a", "g8": "b", "hard": "b"}
 GRADIENT = ("alie_win", "sign_flip_win")
@@ -49,7 +49,7 @@ def prepare(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def _read(part: str) -> pd.DataFrame:
-    """One xp7 part, prepared, with its manifest columns; cached as a pickle (the CSVs are ~190 MB)."""
+    """One xp7 part, prepared, with its manifest columns; cached in results/xp7/cache (the CSVs are ~190 MB)."""
     CACHE.mkdir(parents=True, exist_ok=True)
     f = CACHE / f"{part}.pkl"
     if f.exists():

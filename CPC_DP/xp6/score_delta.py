@@ -1,6 +1,6 @@
 """Score models on Delta_k against the xp6 onset twins (evaluation only), and their factual error on the same sets.
 
-    ../.venv/Scripts/python score_delta.py --cpc results/cpc/A0_h64 results/cpc/A2_h64 --gru --out results/delta
+    ../.venv/Scripts/python xp6/score_delta.py --cpc results/xp6/models/A0_h64 results/xp6/models/A2_h64 --gru
 
 --gru adds the xp6 OutcomeGRU (model d of xp6_all) as the baseline. Normalisation for every model = the xp6
 training runs (identical to the GRU's). Output: delta_runs.csv (one row per on-plan), delta_summary.csv (by model x
@@ -8,6 +8,7 @@ group x attack, and by model x d x k), factual.csv; a printed summary.
 """
 
 import argparse
+import sys
 import json
 from pathlib import Path
 
@@ -15,7 +16,9 @@ import pandas as pd
 import torch
 
 HERE = Path(__file__).resolve().parent
-XP6 = HERE.parent / "GRU_mnist/results/xp6_all/results/xp6"
+ROOT = HERE.parent if HERE.name in ("xp6", "xp7") else HERE  # local: CPC_DP/xp7/; Kaggle: files flat in $WORK
+sys.path.insert(0, str(ROOT))
+XP6 = ROOT.parent / "GRU_mnist/results/xp6_all/results/xp6"
 
 from cpc.data import RunData, load_splits  # noqa: E402
 from cpc.evaluate import CPCPredictor, GRUPredictor, delta_metrics, factual_table, score_twins  # noqa: E402
@@ -33,13 +36,13 @@ def load_gru(folder: Path, tr: RunData, device) -> OutcomeGRU:
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--runs", type=Path, default=XP6 / "runs_xp6/all_blocks.csv")
-    ap.add_argument("--eval", type=Path, default=HERE / "results/xp6_eval", help="folder with all_blocks.csv + manifest.csv")
+    ap.add_argument("--eval", type=Path, default=ROOT / "results/xp6/eval", help="folder with all_blocks.csv + manifest.csv")
     ap.add_argument("--cpc", type=Path, nargs="*", default=[])
     ap.add_argument("--gru", action="store_true")
     ap.add_argument("--gru-folder", type=Path, default=XP6 / "gru/d")
     ap.add_argument("--lam", type=float, default=1.0)
     ap.add_argument("--tau", type=int, default=20)
-    ap.add_argument("--out", type=Path, default=HERE / "results/delta")
+    ap.add_argument("--out", type=Path, default=ROOT / "results/xp6/delta")
     ap.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     args = ap.parse_args()
 

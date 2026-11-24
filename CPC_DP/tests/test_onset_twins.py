@@ -7,7 +7,7 @@ import pandas as pd
 import pytest
 
 HERE = Path(__file__).resolve().parent.parent
-sys.path.insert(0, str(HERE))
+sys.path.insert(0, str(HERE / "xp6" if (HERE / "xp6").is_dir() else HERE))  # local: CPC_DP/xp6/; Kaggle: flat
 import onset_twins as O  # noqa: E402
 import run_experiment as R  # noqa: E402
 from poison_testbed.runner import make_schedule  # noqa: E402

@@ -1,7 +1,7 @@
 """xp7 trajectory plots (layout of GRU_mnist/deploy_xp5.py): per attack family, 3 seeds (val/test setups, which have
 an always-off twin), each run under the 4 policies (same seed = same data and noise).
 
-    ../.venv/Scripts/python plot_xp7.py            # -> results/xp7_plots/trajectory_<family>.png, twins.png
+    ../.venv/Scripts/python xp7/plot_xp7.py            # -> results/xp7/plots/trajectory_<family>.png, twins.png
 
 Rows: attack success (backdoor / flip: y_atk; ALIE / SignFlip: no-attack reference clean accuracy at the same block
 and W, minus clean accuracy), clean accuracy, defended blocks. Grey band = attack active.
@@ -20,12 +20,14 @@ from matplotlib.lines import Line2D  # noqa: E402
 from matplotlib.patches import Patch  # noqa: E402
 
 HERE = Path(__file__).resolve().parent
-sys.path.insert(0, str(HERE.parent / "GRU_mnist"))
+ROOT = HERE.parent if HERE.name in ("xp6", "xp7") else HERE  # local: CPC_DP/xp7/; Kaggle: files flat in $WORK
+sys.path.insert(0, str(ROOT))
+sys.path.insert(0, str(ROOT.parent / "GRU_mnist"))
 from analyze import INK, INK2  # noqa: E402  (also sets the GRU_mnist figure style)
 
-RES = HERE / "results"
-SRC = {"a": RES / "xp7_a/results/xp7_a", "b": RES / "xp7_b/results/xp7_b", "twins": RES / "xp7_twins/results/xp7_twins"}
-OUT = RES / "xp7_plots"
+RES = ROOT / "results/xp7"
+SRC = {p: RES / p for p in ("a", "b", "twins")}
+OUT = RES / "plots"
 COLS = ["run_id", "block", "W", "y_clean_acc", "y_atk", "u_active"]
 POLICIES = ["off", "g0", "g2", "g8", "hard"]
 COLOR = {"off": "#1baf7a", "g0": "#8a94a6", "g2": "#9ec2ee", "g8": "#2a78d6", "hard": "#eb6834"}

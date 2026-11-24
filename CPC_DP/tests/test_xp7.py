@@ -6,7 +6,7 @@ import sys
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent.parent
-sys.path.insert(0, str(HERE))
+sys.path.insert(0, str(HERE / "xp7" if (HERE / "xp7").is_dir() else HERE))  # local: CPC_DP/xp7/; Kaggle: flat
 
 import xp7  # noqa: E402
 from poison_testbed.alarm import GammaSchedule  # noqa: E402
