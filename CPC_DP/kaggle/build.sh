@@ -14,7 +14,8 @@ PAIRS+=("$G/poison_testbed/alarm_xp5.json:poison_testbed/alarm_xp5.json" "$G/run
         "$G/tests/test_testbed.py:tests/test_testbed.py" "xp6/onset_twins.py:onset_twins.py"
         "tests/test_onset_twins.py:tests/test_onset_twins.py" "xp7/xp7.py:xp7.py" "tests/test_xp7.py:tests/test_xp7.py"
         "$G/analyze.py:analyze.py" "$G/gru_experiment.py:gru_experiment.py" "xp7/deploy_xp7.py:deploy_xp7.py"
-        "xp8/xp8.py:xp8.py" "tests/test_xp8.py:tests/test_xp8.py")
+        "xp8/xp8.py:xp8.py" "tests/test_xp8.py:tests/test_xp8.py" "xp8/learn8.py:learn8.py"
+        "xp8/live8.py:live8.py" "tests/test_learn8.py:tests/test_learn8.py")
 for f in cpc/*.py; do PAIRS+=("$f:cpc/$(basename "$f")"); done
 # Trained models deployed by stage xp7_deploy (binary: a base64 tar.gz, checked below).
 DEPLOY_MODELS=(g0/gru g0/A2 hard/gru hard/A2)
